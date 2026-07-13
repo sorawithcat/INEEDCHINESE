@@ -1,0 +1,8 @@
+.cancel{width:100%;margin-top:9px;padding:10px;border-radius:9px;background:#392126;color:#fda4af;border:1px solid #71313d;cursor:pointer}
+.progress{margin-top:15px;padding:12px;background:#0d1117;border-radius:9px}
+.progress div{display:flex;justify-content:space-between;font-size:13px}
+.progress span,.progress p{color:#8b949e}
+.progress p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:8px 0}
+.progress meter{width:100%;accent-color:#34d399}
+.failures{margin-top:12px;color:#fda4af;font-size:12px}
+.failures p{word-break:break-all}

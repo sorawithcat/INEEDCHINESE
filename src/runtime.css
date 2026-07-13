@@ -1,0 +1,15 @@
+.runtimeButton{width:100%;margin-top:10px;padding:11px;border-radius:9px;border:1px solid #3b82f6;background:#172554;color:#bfdbfe;font-weight:700;cursor:pointer}
+.runtimeButton.active{border-color:#f43f5e;background:#3f1822;color:#fecdd3}
+.runtimeButton.unity{border-color:#a78bfa;background:#251b43;color:#ddd6fe}
+.runtimeButton.generic{border-color:#f59e0b;background:#34240d;color:#fde68a}
+.runtimeButton.rpg{border-color:#22d3ee;background:#12313a;color:#cffafe}
+.runtimeButton.tyrano{border-color:#f472b6;background:#3b172e;color:#fce7f3}
+.runtimeButton.ocr{border-color:#94a3b8;background:#202a38;color:#e2e8f0}
+.ocrPicker{display:grid;grid-template-columns:auto 1fr;gap:7px;margin-top:13px}
+.ocrPicker button{border:1px solid #475569;border-radius:8px;background:#1e293b;color:#e2e8f0;padding:8px;cursor:pointer}
+.ocrPicker select{padding:8px}
+.runtimeButton:disabled{opacity:.4;cursor:not-allowed}
+.runtimeStatus{margin-top:13px;padding:12px;border-radius:9px;background:#101b2d}
+.runtimeStatus span{font-size:11px;color:#60a5fa}
+.runtimeStatus p{font-size:13px;line-height:1.5;margin:6px 0 0}
+.runtimeError{font-size:12px;color:#fda4af;word-break:break-all}
