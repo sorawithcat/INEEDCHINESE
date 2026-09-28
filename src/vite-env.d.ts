@@ -18,12 +18,13 @@ type Status = {
   cached?: boolean
   patched?: boolean
   alreadyInstalled?: boolean
+  ocrImage?: boolean
   files?: number
 }
 
 interface Window {
   translator: {
-    chooseTarget(): Promise<string | undefined>
+    chooseTarget(mode?: 'folder'): Promise<string | undefined>
     pathForFile(file: File): string
     start(request: { targetPath: string; provider: ProviderSettings; preferHook?: boolean }): Promise<void>
     stop(): Promise<void>

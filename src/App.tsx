@@ -104,9 +104,11 @@ export default function App() {
         {!status || status.phase === 'stopped' ? (
           <div className="hint">
             {status?.message && <p className="lastMessage">{status.message}</p>}
-            <p className="big">把游戏 .exe 拖到这里</p>
-            <p className="small">自动识别引擎，自动开始翻译</p>
-            <p className="small dim">也可以点击选择文件或文件夹</p>
+            <p className="big">把文件拖到这里，自动翻译</p>
+            <p className="small">.exe · .txt · .json · .png · .jpg · .jpeg · .webp · .bmp</p>
+            <p className="small dim">
+              点击选择文件 · <a className="link" onClick={event => { event.stopPropagation(); window.translator.chooseTarget('folder').then(begin) }}>选择文件夹</a>
+            </p>
           </div>
         ) : status.phase === 'inspect' ? (
           <div className="hint"><p className="big">正在识别…</p>{status.engine && <p className="small">{status.engine}</p>}</div>
@@ -152,13 +154,24 @@ export default function App() {
             <button className="button danger" onClick={stop}>停止</button>
           </div>
         ) : status.phase === 'done' ? (
-          <div className="hint" onClick={event => event.stopPropagation()}>
-            <p className="big">✓ {status.engine}</p>
+          <div className="hint wide" onClick={event => event.stopPropagation()}>
+            <p className="big">✓ {status.engine || '完成'}</p>
             <p className="small">{status.message}</p>
-            <div className="row">
-              {status.patched && <button className="button" onClick={restore}>恢复原文</button>}
-              <button className="button primary" onClick={() => setStatus(undefined)}>翻译下一项</button>
-            </div>
+            {status.translated && (
+              <>
+                <div className="pasteResult">{status.translated}</div>
+                <div className="row">
+                  <button className="button" onClick={() => navigator.clipboard.writeText(status.translated || '')}>复制译文</button>
+                  <button className="button primary" onClick={() => setStatus(undefined)}>翻译下一项</button>
+                </div>
+              </>
+            )}
+            {!status.translated && (
+              <div className="row">
+                {status.patched && <button className="button" onClick={restore}>恢复原文</button>}
+                <button className="button primary" onClick={() => setStatus(undefined)}>翻译下一项</button>
+              </div>
+            )}
           </div>
         ) : status.phase === 'error' ? (
           <div className="hint" onClick={event => event.stopPropagation()}>

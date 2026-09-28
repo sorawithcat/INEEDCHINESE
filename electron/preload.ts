@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 contextBridge.exposeInMainWorld('translator', {
-  chooseTarget: () => ipcRenderer.invoke('choose-target'),
+  chooseTarget: (mode?: string) => ipcRenderer.invoke('choose-target', mode),
   pathForFile: (file: File) => webUtils.getPathForFile(file),
   start: (request: unknown) => ipcRenderer.invoke('start', request),
   stop: () => ipcRenderer.invoke('stop'),

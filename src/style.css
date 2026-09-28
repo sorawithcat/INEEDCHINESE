@@ -121,6 +121,7 @@ body {
 .hint .big.error { color: var(--danger); }
 .hint .small { color: var(--dim); margin-top: 4px; word-break: break-all; }
 .hint .dim { opacity: .7; }
+.link { color: var(--accent); cursor: pointer; text-decoration: underline; }
 .lastMessage { color: var(--dim); margin-bottom: 14px; font-size: 13px; }
 
 .live { color: #4ade80; font-size: 12px; }

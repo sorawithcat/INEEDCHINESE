@@ -15,6 +15,7 @@ const storyPrompt = '将游戏文本翻译为自然的简体中文。保留人�
 const uiPrompt = '将界面文本翻译为简洁准确的简体中文，按钮文字简短，术语前后一致。'
 
 const supported = new Set(['.txt', '.json'])
+const imageExts = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp'])
 const execFileAsync = promisify(execFile)
 
 let overlay: BrowserWindow | undefined
@@ -573,6 +574,20 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
 
     const targetStat = await fs.stat(request.targetPath)
     const isSingleTextFile = targetStat.isFile() && supported.has(path.extname(request.targetPath).toLowerCase())
+
+    // 图片：OCR 识别图中文字 → 翻译 → 直接展示结果
+    if (targetStat.isFile() && imageExts.has(path.extname(request.targetPath).toLowerCase())) {
+      send({ phase: 'ocr-waiting', message: '正在识别图片文字…' })
+      if (!ocrWorker) ocrWorker = await createWorker(['jpn', 'eng'])
+      const result = await ocrWorker.recognize(request.targetPath)
+      const text = result.data.text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 2).join('\n').trim()
+      if (!text) { send({ phase: 'done', engine: '图片', message: '未在图片中识别到文字' }); return }
+      if (signal.aborted) throw new Error('已取消')
+      const chunks = textChunks(text, 2000)
+      const translated = await translateBatch(chunks, request.provider, { prompt: '将图片中识别出的文字翻译为自然的简体中文，保留换行。', signal })
+      send({ phase: 'done', engine: '图片', ocrImage: true, source: text, translated: translated.join(''), message: '图片识别翻译完成' })
+      return
+    }
     const manifest = await readManifest(info.root)
     let covered = false
     if (manifest) {
@@ -623,7 +638,12 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
-  ipcMain.handle('choose-target', async () => (await dialog.showOpenDialog({ properties: ['openFile', 'openDirectory'], filters: [{ name: '应用程序', extensions: ['exe', 'txt', 'json'] }] })).filePaths[0])
+  ipcMain.handle('choose-target', async (_event, mode?: string) => {
+    const options: Electron.OpenDialogOptions = mode === 'folder'
+      ? { properties: ['openDirectory'] }
+      : { properties: ['openFile'], filters: [{ name: '支持的文件', extensions: ['exe', 'txt', 'json', 'png', 'jpg', 'jpeg', 'webp', 'bmp'] }] }
+    return (await dialog.showOpenDialog(options)).filePaths[0]
+  })
   ipcMain.handle('start', (event, request: StartRequest) => start(event, request))
   ipcMain.handle('stop', async event => { await stopSession(); if (!event.sender.isDestroyed()) event.sender.send('status', { phase: 'stopped', message: '已停止' }) })
   ipcMain.handle('restore', async (_event, target: string) => restorePatch(target))
