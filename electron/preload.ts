@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld('translator', {
   switchThread: () => ipcRenderer.invoke('switch-thread'),
   useOcr: () => ipcRenderer.invoke('use-ocr'),
   translateText: (request: unknown) => ipcRenderer.invoke('translate-text', request),
+  setOverlayPrefs: (prefs: unknown) => ipcRenderer.invoke('set-overlay-prefs', prefs),
+  saveLlmConfig: (config: unknown) => ipcRenderer.invoke('save-llm-config', config),
+  getLlmConfig: () => ipcRenderer.invoke('get-llm-config'),
   closeOverlay: () => ipcRenderer.invoke('close-overlay'),
   onStatus: (callback: (status: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status)

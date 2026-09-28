@@ -120,6 +120,29 @@ const engines: Engine[] = [
 ]
 let lastGood = 0
 
+/** 单引擎调用前先把超长文本按段落切成 GET 安全的片段 */
+async function runChunked(engine: Engine, text: string, signal: AbortSignal): Promise<string> {
+  if (text.length <= 1800) return engine.run(text, signal)
+  const parts = text.split(/(\r?\n\s*\r?\n)/)
+  const chunks: string[] = []
+  let current = ''
+  for (const part of parts) {
+    if (current && current.length + part.length > 1800) { chunks.push(current); current = '' }
+    if (part.length <= 1800) current += part
+    else {
+      if (current) { chunks.push(current); current = '' }
+      for (let i = 0; i < part.length; i += 1800) chunks.push(part.slice(i, i + 1800))
+    }
+  }
+  if (current) chunks.push(current)
+  const output: string[] = []
+  for (const chunk of chunks) {
+    if (signal.aborted) throw new Error('已取消')
+    output.push(await engine.run(chunk, signal))
+  }
+  return output.join('')
+}
+
 /** 免费链单条翻译：从最近成功的引擎开始，失败自动轮换。 */
 export async function translateFree(text: string, signal: AbortSignal): Promise<string> {
   if (signal.aborted) throw new Error('已取消')
@@ -130,7 +153,7 @@ export async function translateFree(text: string, signal: AbortSignal): Promise<
     const engine = engines[index]
     if (engine.cooldownUntil > now) { errors.push(`${engine.name}: 冷却中`); continue }
     try {
-      const translated = await engine.run(text, signal)
+      const translated = await runChunked(engine, text, signal)
       engine.failures = 0
       lastGood = index
       return translated

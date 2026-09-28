@@ -33,22 +33,30 @@ function scheduleSave() {
   if (saveTimer) return
   saveTimer = setTimeout(async () => {
     saveTimer = undefined
-    try {
-      await fs.mkdir(path.dirname(cacheFile()), { recursive: true })
-      await fs.writeFile(cacheFile(), JSON.stringify(Object.fromEntries(cache)), 'utf8')
-    } catch {
-      // 缓存写失败不影响翻译
-    }
+    await flushCache()
   }, 800)
 }
 
-function cacheKey(settings: ProviderSettings, text: string) {
+/** 立即落盘缓存（退出前调用，防止防抖窗口内丢译文） */
+export async function flushCache() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = undefined }
+  if (!cacheLoaded) return
+  try {
+    await fs.mkdir(path.dirname(cacheFile()), { recursive: true })
+    await fs.writeFile(cacheFile(), JSON.stringify(Object.fromEntries(cache)), 'utf8')
+  } catch {
+    // 缓存写失败不影响退出
+  }
+}
+
+function cacheKey(settings: ProviderSettings, text: string, prompt: string) {
   const id = settings.kind === 'google' ? 'free' : `llm:${settings.baseUrl}:${settings.model}`
-  return crypto.createHash('sha256').update(JSON.stringify([id, text])).digest('hex')
+  const promptHash = crypto.createHash('sha256').update(prompt).digest('hex').slice(0, 12)
+  return crypto.createHash('sha256').update(JSON.stringify([id, promptHash, text])).digest('hex')
 }
 
 export function placeholdersOf(text: string): string[] {
-  return text.match(/(?:\{[^{}]+\}|%\d*\$?[a-zA-Z]|\\[A-Za-z]+(?:\[[^\]]*])?|\[[^\]]+]|<\/?[^>]+>|&[A-Za-z_]\w*)/g) || []
+  return text.match(/(?:\{[^{}]+\}|%\d*\$?[a-zA-Z]|\\[A-Za-z]+(?:\[[^\]]*])?|\[[A-Za-z][^\]]*]|<\/?[^>]+>|&[A-Za-z_]\w*)/g) || []
 }
 
 export function placeholdersPreserved(source: string, translated: string) {
@@ -73,7 +81,7 @@ async function request<T>(fn: () => Promise<T>, signal: AbortSignal, attempts = 
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-async function googleBatch(texts: string[], signal: AbortSignal, onItem?: () => void): Promise<string[]> {
+async function googleBatch(texts: string[], signal: AbortSignal, onItem?: () => void, onTranslated?: (index: number, translated: string) => void): Promise<string[]> {
   const output: string[] = new Array(texts.length)
   let cursor = 0
   const workers = Array.from({ length: Math.min(3, texts.length) }, async () => {
@@ -83,6 +91,7 @@ async function googleBatch(texts: string[], signal: AbortSignal, onItem?: () => 
       // 随机间隔降低限流概率
       await sleep(80 + Math.random() * 170)
       output[index] = await translateFree(texts[index], signal)
+      onTranslated?.(index, output[index])
       onItem?.()
     }
   })
@@ -125,7 +134,7 @@ async function askLlm(text: string, prompt: string, settings: Extract<ProviderSe
   }, signal)
 }
 
-async function llmBatch(texts: string[], ctx: TranslateContext, settings: Extract<ProviderSettings, { kind: 'llm' }>, onItem?: (done: number, total: number) => void): Promise<string[]> {
+async function llmBatch(texts: string[], ctx: TranslateContext, settings: Extract<ProviderSettings, { kind: 'llm' }>, onItem?: (done: number, total: number) => void, onTranslated?: (index: number, translated: string) => void): Promise<string[]> {
   const batches: { index: number; text: string }[][] = []
   for (const [index, text] of texts.entries()) {
     const last = batches.at(-1)
@@ -146,6 +155,7 @@ async function llmBatch(texts: string[], ctx: TranslateContext, settings: Extrac
         if (!source || typeof item.text !== 'string') throw new Error('AI 返回缺少部分译文')
         if (!placeholdersPreserved(source.text, item.text)) throw new Error('译文占位符校验失败')
         output[source.index] = item.text
+        onTranslated?.(source.index, item.text)
       }
       done += batch.length
       onItem?.(done, texts.length)
@@ -162,7 +172,8 @@ export async function translateBatch(
   onProgress?: (done: number, total: number) => void,
 ): Promise<string[]> {
   await loadCache()
-  const keys = texts.map(text => cacheKey(settings, text))
+  const keyOf = (text: string) => cacheKey(settings, text, ctx.prompt)
+  const keys = texts.map(keyOf)
   const missing: { position: number; text: string }[] = []
   const seen = new Map<string, number>()
   texts.forEach((text, position) => {
@@ -173,11 +184,16 @@ export async function translateBatch(
   if (missing.length) {
     let done = 0
     const tick = () => { done++; onProgress?.(done, missing.length) }
+    // 逐条/逐批落缓存：中途失败不丢已译结果
+    const writeThrough = (index: number, translated: string) => {
+      cache.set(keyOf(missing[index].text), translated)
+      scheduleSave()
+    }
     const translated = settings.kind === 'google'
-      ? await googleBatch(missing.map(item => item.text), ctx.signal, tick)
-      : await llmBatch(missing.map(item => item.text), ctx, settings, (d, t) => onProgress?.(d, t))
+      ? await googleBatch(missing.map(item => item.text), ctx.signal, tick, writeThrough)
+      : await llmBatch(missing.map(item => item.text), ctx, settings, (d, t) => onProgress?.(d, t), writeThrough)
     missing.forEach((item, index) => {
-      cache.set(cacheKey(settings, item.text), translated[index])
+      cache.set(keyOf(item.text), translated[index])
     })
     scheduleSave()
   }
@@ -187,7 +203,7 @@ export async function translateBatch(
 /** 单条实时翻译（OCR 字幕用），先查缓存。 */
 export async function translateOne(text: string, settings: ProviderSettings, ctx: TranslateContext): Promise<{ translated: string; cached: boolean }> {
   await loadCache()
-  const key = cacheKey(settings, text)
+  const key = cacheKey(settings, text, ctx.prompt)
   const hit = cache.get(key)
   if (hit) return { translated: hit, cached: true }
   const translated = settings.kind === 'google'

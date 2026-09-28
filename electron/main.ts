@@ -1,14 +1,20 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage, screen, shell } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createWorker, type Worker } from 'tesseract.js'
-import { translateBatch, translateOne, type ProviderSettings } from './provider'
+import { flushCache, translateBatch, translateOne, type ProviderSettings } from './provider'
 import { HookSession, exeArch } from './hook'
 
-type StartRequest = { targetPath: string; provider: ProviderSettings; preferHook?: boolean }
+type StartRequest = {
+  targetPath: string
+  provider: ProviderSettings
+  preferHook?: boolean
+  ocrLangs?: string[]
+  overlayPrefs?: { fontSize: number; opacity: number }
+}
 type PatchManifest = { version: 1; engine: string; createdAt: string; files: { path: string; created: boolean; originalHash?: string; patchedHash: string }[] }
 
 const storyPrompt = '将游戏文本翻译为自然的简体中文。保留人物语气、世界观术语和情绪，不擅自增删内容。'
@@ -66,9 +72,10 @@ async function inspectTarget(target: string) {
   const all: string[] = []
   async function scan(dir: string) {
     for (const item of await fs.readdir(dir, { withFileTypes: true })) {
+      if (all.length >= 5000) return
       if (['node_modules', '.git', '.ineedchinese', 'INEEDCHINESE_zh-CN'].includes(item.name)) continue
       const full = path.join(dir, item.name)
-      if (item.isDirectory() && all.length < 5000) await scan(full)
+      if (item.isDirectory()) await scan(full)
       else all.push(full)
     }
   }
@@ -209,7 +216,7 @@ async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<Ret
     const originals: string[] = []
     for (const file of scripts) {
       for (const line of (await readTextStrict(file)).text.split(/\r?\n/)) {
-        const match = line.match(/^\s*(?:[A-Za-z_]\w*\s+)?("(?:\\.|[^"\\])*")\s*(?:#.*)?$/)
+        const match = line.match(/^\s*(?:[A-Za-z_]\w*\s+)?("(?:\\.|[^"\\])*")\s*(?:if\s+.+?)?\s*(?:#.*)?$/)
         if (match) { try { const text = JSON.parse(match[1]) as string; if (shouldTranslate(text)) originals.push(text) } catch { /* 非法字符串字面量 */ } }
       }
     }
@@ -316,11 +323,15 @@ async function restorePatch(target: string) {
   const internal = path.join(info.root, '.ineedchinese')
   const manifestPath = path.join(internal, 'patch-manifest.json')
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as PatchManifest
+  // 先全量校验，全部通过才动手，杜绝半恢复
   for (const entry of manifest.files) {
     const destination = safeRelativePath(info.root, entry.path)
-    if (await fs.stat(destination).then(() => true).catch(() => false)) {
-      if (sha256(await fs.readFile(destination)) !== entry.patchedHash) throw new Error(`文件在安装补丁后被修改，拒绝覆盖：${entry.path}`)
-    }
+    const exists = await fs.stat(destination).then(() => true).catch(() => false)
+    if (exists && sha256(await fs.readFile(destination)) !== entry.patchedHash) throw new Error(`文件在安装补丁后被修改，拒绝覆盖：${entry.path}`)
+    if (!exists && !entry.created) throw new Error(`文件缺失，无法恢复：${entry.path}`)
+  }
+  for (const entry of manifest.files) {
+    const destination = safeRelativePath(info.root, entry.path)
     if (entry.created) await fs.unlink(destination).catch(() => undefined)
     else await fs.copyFile(safeRelativePath(path.join(internal, 'backup'), entry.path), destination)
   }
@@ -335,27 +346,51 @@ async function readManifest(root: string): Promise<PatchManifest | undefined> {
 
 // ---------- 字幕窗 ----------
 
+let overlayPrefs = { fontSize: 24, opacity: 0.9 }
+
 function showOverlay(source: string, translated: string) {
   if (overlayDismissed) return
   if (!overlay || overlay.isDestroyed()) {
-    overlay = new BrowserWindow({ width: 1000, height: 220, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true, focusable: true, resizable: true, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } })
-    overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent('<style>*{box-sizing:border-box}body{margin:0;background:rgba(8,12,18,.9);color:white;font-family:"Microsoft YaHei";border-radius:14px;overflow:hidden}.bar{height:34px;display:flex;align-items:center;padding-left:14px;color:#94a3b8;font-size:12px;-webkit-app-region:drag}.close{margin-left:auto;width:42px;height:34px;border:0;background:transparent;color:#cbd5e1;font-size:22px;cursor:pointer;-webkit-app-region:no-drag}.close:hover{background:#be123c;color:white}.content{height:calc(100vh - 34px);overflow:auto;padding:4px 20px 18px}.content::-webkit-scrollbar{width:8px}.content::-webkit-scrollbar-thumb{background:#475569;border-radius:4px}#zh{font-size:24px;line-height:1.55}#src{font-size:13px;color:#9ca3af;margin-top:10px}</style><div class="bar">INEEDCHINESE 字幕<button class="close" title="关闭字幕" onclick="window.translator.closeOverlay()">×</button></div><div class="content"><div id="zh"></div><div id="src"></div></div>')}`)
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize
+    overlay = new BrowserWindow({
+      width: 1000, height: 200,
+      x: Math.round((width - 1000) / 2), y: height - 260,
+      transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
+      focusable: false, resizable: false,
+      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+    })
+    // 点击穿透：不抢游戏焦点，关闭走主窗口「停止」
+    overlay.setIgnoreMouseEvents(true, { forward: true })
+    overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent('<style>*{box-sizing:border-box}body{margin:0;color:white;font-family:"Microsoft YaHei";border-radius:14px;overflow:hidden;padding:14px 22px}.content{max-height:172px;overflow:hidden}#zh{line-height:1.5}#src{font-size:12px;color:#9ca3af;margin-top:8px}</style><div class="content"><div id="zh"></div><div id="src"></div></div>')}`)
     overlay.once('ready-to-show', () => showOverlay(source, translated))
-    overlay.showInactive()
     return
   }
-  overlay.webContents.executeJavaScript(`document.getElementById('zh').textContent=${JSON.stringify(translated)};document.getElementById('src').textContent=${JSON.stringify(source)}`)
+  overlay.webContents.executeJavaScript(`document.getElementById('zh').textContent=${JSON.stringify(translated)};document.getElementById('src').textContent=${JSON.stringify(source)};document.getElementById('zh').style.fontSize='${overlayPrefs.fontSize}px';document.body.style.background='rgba(8,12,18,${overlayPrefs.opacity})'`)
   overlay.showInactive()
 }
 
 // ---------- OCR 实时字幕 ----------
 
+let ocrWorkerLangs: string[] = []
+
+async function getOcrWorker(langs: string[]) {
+  if (ocrWorker && ocrWorkerLangs.join('+') !== langs.join('+')) {
+    await ocrWorker.terminate()
+    ocrWorker = undefined
+  }
+  if (!ocrWorker) {
+    ocrWorker = await createWorker(langs)
+    ocrWorkerLangs = [...langs]
+  }
+  return ocrWorker
+}
+
 async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartRequest & { sourceId: string; sourceMatch?: string }, signal: AbortSignal) {
   if (ocrTimer) clearInterval(ocrTimer)
-  if (!ocrWorker) {
-    event.sender.send('status', { phase: 'ocr-waiting', message: '首次加载 OCR 模型…' })
-    ocrWorker = await createWorker(['jpn', 'eng'])
+  if (!ocrWorker || ocrWorkerLangs.join('+') !== (request.ocrLangs || ['jpn', 'eng']).join('+')) {
+    event.sender.send('status', { phase: 'ocr-waiting', message: '正在加载 OCR 模型…' })
   }
+  await getOcrWorker(request.ocrLangs || ['jpn', 'eng'])
   let previous = ''
   let previousFrame = ''
   let sourceId = request.sourceId
@@ -365,7 +400,7 @@ async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartReques
     if (processing || signal.aborted) return
     processing = true
     try {
-      const sources = await desktopCapturer.getSources({ types: ['window', 'screen'], thumbnailSize: { width: 1280, height: 720 } })
+      const sources = await desktopCapturer.getSources({ types: ['window', 'screen'], thumbnailSize: { width: 1920, height: 1080 } })
       const source = sources.find(item => item.id === sourceId) || sources.find(item => {
         const name = item.name.toLowerCase().replace(/\W/g, '')
         return Boolean(request.sourceMatch && name && (name.includes(request.sourceMatch) || request.sourceMatch.includes(name)))
@@ -377,6 +412,8 @@ async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartReques
       if (frameHash === previousFrame) return
       previousFrame = frameHash
       const result = await ocrWorker!.recognize(image)
+      // 低置信度帧多为乱字，忽略防止误翻
+      if ((result.data.confidence ?? 100) < 55) return
       const text = result.data.text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 2).join('\n').trim()
       if (!text || text === previous) return
       previous = text
@@ -453,14 +490,24 @@ function cjkScore(text: string) {
   return (text.match(/[぀-ヿ㐀-鿿가-힯]/g) || []).length
 }
 
-async function forwardHookText(text: string, cached = false) {
+let hookQueue: Promise<void> = Promise.resolve()
+const hookHistory: string[] = []
+
+function forwardHookText(text: string, cached = false) {
+  // 串行队列：防止并发请求乱序上字幕、触发限流
+  hookQueue = hookQueue.then(() => doForwardHookText(text, cached)).catch(() => undefined)
+}
+
+async function doForwardHookText(text: string, cached: boolean) {
   const context = hookContext
   if (!context || context.signal.aborted) return
   hookLastForwarded = text
   const { event, request, signal } = context
   try {
-    const prompt = `${storyPrompt}\n只翻译台词/界面文本，忽略乱码与控制符。`
+    const history = hookHistory.slice(-5).join('\n')
+    const prompt = `${storyPrompt}\n只翻译台词/界面文本，忽略乱码与控制符。${history ? `\n以下为此前文本，仅用于理解上下文：\n${history}` : ''}`
     const result = await translateOne(text, request.provider, { prompt, signal })
+    hookHistory.push(text)
     showOverlay(text, result.translated)
     event.sender.send('status', { phase: 'hook', source: text, translated: result.translated, cached: cached || result.cached })
   } catch (error) {
@@ -489,6 +536,8 @@ async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartR
   hookLastForwarded = ''
   hookTriedLaunch = false
   hookGotText = false
+  hookQueue = Promise.resolve()
+  hookHistory.length = 0
   event.sender.send('status', { phase: 'hook-waiting', message: '正在注入文本 Hook…' })
 
   const onText = (line: { handle: string; text: string }) => {
@@ -540,6 +589,34 @@ function switchThread() {
   return handles.indexOf(hookActiveHandle) + 1
 }
 
+// ---------- 配置存储（API Key 用 safeStorage 加密） ----------
+
+type LlmStored = { baseUrl: string; model: string; temperature: number; apiKey: string }
+
+function configFile() {
+  return path.join(app.getPath('userData'), 'config.json')
+}
+
+async function readLlmConfig(): Promise<LlmStored | undefined> {
+  try {
+    const raw = JSON.parse(await fs.readFile(configFile(), 'utf8')) as { baseUrl?: string; model?: string; temperature?: number; apiKeyEnc?: string }
+    let apiKey = ''
+    if (raw.apiKeyEnc && safeStorage.isEncryptionAvailable()) apiKey = safeStorage.decryptString(Buffer.from(raw.apiKeyEnc, 'base64'))
+    return { baseUrl: raw.baseUrl || '', model: raw.model || '', temperature: raw.temperature ?? 0.2, apiKey }
+  } catch { return undefined }
+}
+
+async function writeLlmConfig(config: LlmStored) {
+  // apiKey 留空时保留已保存的 Key，防止误清空
+  let apiKeyEnc = ''
+  if (config.apiKey && safeStorage.isEncryptionAvailable()) apiKeyEnc = safeStorage.encryptString(config.apiKey).toString('base64')
+  else {
+    try { apiKeyEnc = (JSON.parse(await fs.readFile(configFile(), 'utf8')) as { apiKeyEnc?: string }).apiKeyEnc || '' } catch { /* 无旧配置 */ }
+  }
+  await fs.mkdir(path.dirname(configFile()), { recursive: true })
+  await fs.writeFile(configFile(), JSON.stringify({ baseUrl: config.baseUrl, model: config.model, temperature: config.temperature, apiKeyEnc }), 'utf8')
+}
+
 // ---------- 会话管理 ----------
 
 async function stopSession() {
@@ -566,6 +643,12 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
   session = new AbortController()
   const signal = session.signal
   overlayDismissed = false
+  if (request.overlayPrefs) overlayPrefs = request.overlayPrefs
+  // LLM 的 Key 由主进程加密保存，渲染进程不持久化明文
+  if (request.provider.kind === 'llm' && !request.provider.apiKey) {
+    const stored = await readLlmConfig()
+    if (stored?.apiKey) request = { ...request, provider: { ...request.provider, apiKey: stored.apiKey } }
+  }
   const send = (data: Record<string, unknown>) => { if (!event.sender.isDestroyed()) event.sender.send('status', data) }
   try {
     send({ phase: 'inspect' })
@@ -578,8 +661,8 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
     // 图片：OCR 识别图中文字 → 翻译 → 直接展示结果
     if (targetStat.isFile() && imageExts.has(path.extname(request.targetPath).toLowerCase())) {
       send({ phase: 'ocr-waiting', message: '正在识别图片文字…' })
-      if (!ocrWorker) ocrWorker = await createWorker(['jpn', 'eng'])
-      const result = await ocrWorker.recognize(request.targetPath)
+      const worker = await getOcrWorker(request.ocrLangs || ['jpn', 'eng'])
+      const result = await worker.recognize(request.targetPath)
       const text = result.data.text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 2).join('\n').trim()
       if (!text) { send({ phase: 'done', engine: '图片', message: '未在图片中识别到文字' }); return }
       if (signal.aborted) throw new Error('已取消')
@@ -630,6 +713,13 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
 
 // ---------- 窗口与 IPC ----------
 
+// 单实例：重复启动时聚焦已有窗口
+if (!app.requestSingleInstanceLock()) app.quit()
+app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (win) { if (win.isMinimized()) win.restore(); win.focus() }
+})
+
 function createWindow() {
   const win = new BrowserWindow({ width: 720, height: 540, minWidth: 560, minHeight: 440, backgroundColor: '#101418', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } })
   win.setMenuBarVisibility(false)
@@ -654,15 +744,46 @@ app.whenReady().then(() => {
   })
   ipcMain.handle('use-ocr', () => switchToOcr('已手动切换 OCR 字幕'))
   ipcMain.handle('translate-text', async (_event, request: { text: string; provider: ProviderSettings }) => {
+    if (request.provider.kind === 'llm' && !request.provider.apiKey) {
+      const stored = await readLlmConfig()
+      if (stored?.apiKey) request = { ...request, provider: { ...request.provider, apiKey: stored.apiKey } }
+    }
     const chunks = textChunks(request.text, 2000)
     const translated = await translateBatch(chunks, request.provider, { prompt: '将文本翻译为自然的简体中文，保留原文格式、换行与段落。', signal: new AbortController().signal })
     return { translated: translated.join('') }
   })
   ipcMain.handle('close-overlay', async () => {
+    // 只关字幕窗，翻译会话继续（停止走主窗口按钮）
     overlayDismissed = true
-    await stopSession()
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send('status', { phase: 'stopped', message: '字幕已关闭' })
+    overlay?.close()
+    overlay = undefined
+  })
+  ipcMain.handle('set-overlay-prefs', (_event, prefs: { fontSize: number; opacity: number }) => {
+    overlayPrefs = prefs
+    if (overlay && !overlay.isDestroyed()) {
+      overlay.webContents.executeJavaScript(`document.getElementById('zh')&&(document.getElementById('zh').style.fontSize='${prefs.fontSize}px');document.body.style.background='rgba(8,12,18,${prefs.opacity})'`).catch(() => undefined)
+    }
+  })
+  ipcMain.handle('save-llm-config', async (_event, config: LlmStored) => { await writeLlmConfig(config); return { hasKey: Boolean(config.apiKey) } })
+  ipcMain.handle('get-llm-config', async () => {
+    const stored = await readLlmConfig()
+    return stored ? { baseUrl: stored.baseUrl, model: stored.model, temperature: stored.temperature, hasKey: Boolean(stored.apiKey) } : undefined
   })
   createWindow()
+})
+
+// 退出前统一清理：停会话、终止 OCR worker、缓存落盘
+let quitting = false
+app.on('will-quit', event => {
+  if (quitting) return
+  quitting = true
+  event.preventDefault()
+  void (async () => {
+    await stopSession()
+    if (ocrWorker) await ocrWorker.terminate().catch(() => undefined)
+    ocrWorker = undefined
+    await flushCache()
+    app.exit(0)
+  })()
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

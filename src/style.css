@@ -33,6 +33,7 @@ body {
 }
 
 .logo { font-weight: 700; letter-spacing: 1px; font-size: 13px; color: var(--dim); }
+.version { font-weight: 400; font-size: 11px; opacity: .7; margin-left: 4px; }
 
 .gear {
   border: 0;
@@ -148,6 +149,23 @@ body {
 .bar > div { height: 100%; background: var(--accent); border-radius: 3px; transition: width .2s; }
 
 .row { display: flex; gap: 10px; justify-content: center; margin-top: 16px; }
+.row.spread { justify-content: flex-end; margin-top: 0; }
+
+.history { margin-top: 18px; display: flex; flex-direction: column; gap: 6px; align-items: center; }
+.historyItem {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.historyItem:hover { color: var(--text); border-color: var(--accent); }
 
 .button {
   margin-top: 16px;

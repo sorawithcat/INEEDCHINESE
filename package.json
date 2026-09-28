@@ -1,6 +1,6 @@
 {
   "name": "ineedchinese",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "将应用和游戏文本实时翻译为简体中文的桌面工具",
   "author": "sorawithcat",
@@ -14,21 +14,21 @@
     "dist:win": "npm run build && electron-builder --win nsis portable"
   },
   "dependencies": {
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "@vitejs/plugin-react": "latest",
-    "concurrently": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "tesseract.js": "^6.0.1",
-    "typescript": "latest",
-    "vite": "latest",
-    "wait-on": "latest"
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "concurrently": "10.0.3",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "tesseract.js": "6.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.1.4",
+    "wait-on": "9.0.10"
   },
   "devDependencies": {
-    "electron": "latest",
-    "electron-builder": "^26.0.12"
+    "electron": "43.1.0",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.sorawithcat.ineedchinese",
@@ -49,7 +49,8 @@
       "node_modules/tesseract.js-core/**/*"
     ],
     "win": {
-      "target": ["nsis", "portable"]
+      "target": ["nsis", "portable"],
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": false,

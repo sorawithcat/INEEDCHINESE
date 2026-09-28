@@ -47,6 +47,9 @@ export class HookSession {
   private start(args: string[], onText: (event: HookText) => void, onExit: (code: number | null) => void) {
     const cli = cliPath(this.arch)
     this.child = spawn(cli, args, { cwd: path.dirname(cli), windowsHide: true })
+    // error 与 exit 都会触发，只回调一次防止误判
+    let fired = false
+    const exitOnce = (code: number | null) => { if (!fired) { fired = true; onExit(code) } }
     this.child.stdout!.setEncoding('utf8')
     this.child.stdout!.on('data', (chunk: string) => {
       this.buffer += chunk
@@ -57,8 +60,8 @@ export class HookSession {
         if (parsed) onText(parsed)
       }
     })
-    this.child.on('error', () => onExit(2))
-    this.child.on('exit', code => onExit(code))
+    this.child.on('error', () => exitOnce(2))
+    this.child.on('exit', code => exitOnce(code))
   }
 
   kill() {

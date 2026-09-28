@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react'
 
 type LlmConfig = { baseUrl: string; apiKey: string; model: string; temperature: number }
+type HistoryItem = { path: string; time: number }
 
 const defaultLlm: LlmConfig = { baseUrl: 'https://api.deepseek.com', apiKey: '', model: 'deepseek-chat', temperature: 0.2 }
 
 function load<T>(key: string, fallback: T): T {
   try { return { ...fallback, ...JSON.parse(localStorage.getItem(key) || '{}') } } catch { return fallback }
+}
+
+function loadList<T>(key: string): T[] {
+  try { const value = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(value) ? value : [] } catch { return [] }
 }
 
 export default function App() {
@@ -15,7 +20,11 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [providerKind, setProviderKind] = useState<'google' | 'llm'>(() => localStorage.getItem('provider-kind') === 'llm' ? 'llm' : 'google')
   const [llm, setLlm] = useState<LlmConfig>(() => load('llm-config', defaultLlm))
+  const [hasStoredKey, setHasStoredKey] = useState(false)
   const [preferHook, setPreferHook] = useState(() => localStorage.getItem('engine-preference') === 'hook')
+  const [ocrLang, setOcrLang] = useState(() => localStorage.getItem('ocr-lang') || 'jpn+eng')
+  const [overlayPrefs, setOverlayPrefs] = useState<OverlayPrefs>(() => load('overlay-prefs', { fontSize: 24, opacity: 0.9 }))
+  const [history, setHistory] = useState<HistoryItem[]>(() => loadList('history'))
   const [tab, setTab] = useState<'file' | 'text'>('file')
   const [pasteText, setPasteText] = useState('')
   const [pasteResult, setPasteResult] = useState('')
@@ -26,15 +35,45 @@ export default function App() {
 
   useEffect(() => window.translator.onStatus(setStatus), [])
   useEffect(() => localStorage.setItem('provider-kind', providerKind), [providerKind])
-  useEffect(() => localStorage.setItem('llm-config', JSON.stringify(llm)), [llm])
   useEffect(() => localStorage.setItem('engine-preference', preferHook ? 'hook' : 'patch'), [preferHook])
+  useEffect(() => localStorage.setItem('ocr-lang', ocrLang), [ocrLang])
+  useEffect(() => localStorage.setItem('overlay-prefs', JSON.stringify(overlayPrefs)), [overlayPrefs])
+  useEffect(() => { void window.translator.setOverlayPrefs(overlayPrefs) }, [overlayPrefs])
+  useEffect(() => localStorage.setItem('history', JSON.stringify(history)), [history])
+
+  // 加载主进程保存的 LLM 配置；迁移旧版 localStorage 里的明文 Key
+  useEffect(() => {
+    void (async () => {
+      const legacy = load('llm-config', defaultLlm)
+      const stored = await window.translator.getLlmConfig()
+      if (stored) {
+        setLlm({ baseUrl: stored.baseUrl || legacy.baseUrl, apiKey: '', model: stored.model || legacy.model, temperature: stored.temperature })
+        setHasStoredKey(stored.hasKey)
+      }
+      if (legacy.apiKey) {
+        await window.translator.saveLlmConfig({ baseUrl: legacy.baseUrl, model: legacy.model, temperature: legacy.temperature, apiKey: legacy.apiKey })
+        setHasStoredKey(true)
+        localStorage.setItem('llm-config', JSON.stringify({ ...legacy, apiKey: '' }))
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // LLM 配置变化时加密保存到主进程（Key 留空则保留已保存的）
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void window.translator.saveLlmConfig(llm).then(result => { if (llm.apiKey) setHasStoredKey(result.hasKey) })
+    }, 500)
+    return () => clearTimeout(timer)
+  }, [llm])
 
   async function begin(path?: string) {
     if (!path) return
-    if (providerKind === 'llm' && !llm.apiKey) { setSettingsOpen(true); setStatus({ phase: 'error', message: '使用 LLM 翻译前请先填写 API Key' }); return }
+    if (providerKind === 'llm' && !llm.apiKey && !hasStoredKey) { setSettingsOpen(true); setStatus({ phase: 'error', message: '使用 LLM 翻译前请先填写 API Key' }); return }
     setTarget(path)
     setStatus({ phase: 'inspect' })
-    try { await window.translator.start({ targetPath: path, provider, preferHook }) }
+    setHistory(items => [{ path, time: Date.now() }, ...items.filter(item => item.path !== path)].slice(0, 10))
+    try { await window.translator.start({ targetPath: path, provider, preferHook, ocrLangs: ocrLang.split('+'), overlayPrefs }) }
     catch (error) { setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) }) }
   }
 
@@ -53,7 +92,7 @@ export default function App() {
   async function translatePaste() {
     const text = pasteText.trim()
     if (!text || pasteBusy) return
-    if (providerKind === 'llm' && !llm.apiKey) { setSettingsOpen(true); setPasteResult('使用 LLM 翻译前请先在设置里填写 API Key'); return }
+    if (providerKind === 'llm' && !llm.apiKey && !hasStoredKey) { setSettingsOpen(true); setPasteResult('使用 LLM 翻译前请先在设置里填写 API Key'); return }
     setPasteBusy(true)
     setPasteResult('翻译中…')
     try {
@@ -78,7 +117,7 @@ export default function App() {
       }}
     >
       <header className="header">
-        <span className="logo">INEEDCHINESE</span>
+        <span className="logo">INEEDCHINESE <span className="version">v{__APP_VERSION__}</span></span>
         <button className="gear" title="设置" onClick={() => setSettingsOpen(!settingsOpen)}>⚙</button>
       </header>
 
@@ -94,21 +133,34 @@ export default function App() {
             value={pasteText}
             onChange={event => setPasteText(event.target.value)}
           />
-          <button className="button primary" disabled={!pasteText.trim() || pasteBusy} onClick={translatePaste}>
-            {pasteBusy ? '翻译中…' : '翻译'}
-          </button>
+          <div className="row spread">
+            <button className="button primary" disabled={!pasteText.trim() || pasteBusy} onClick={translatePaste}>
+              {pasteBusy ? '翻译中…' : '翻译'}
+            </button>
+            {pasteResult && !pasteBusy && <button className="button" onClick={() => navigator.clipboard.writeText(pasteResult)}>复制译文</button>}
+          </div>
           {pasteResult && <div className="pasteResult">{pasteResult}</div>}
         </main>
       ) : (
       <main className="dropzone" onClick={() => { if (!busy) window.translator.chooseTarget().then(begin) }}>
         {!status || status.phase === 'stopped' ? (
-          <div className="hint">
+          <div className="hint wide">
             {status?.message && <p className="lastMessage">{status.message}</p>}
             <p className="big">把文件拖到这里，自动翻译</p>
             <p className="small">.exe · .txt · .json · .png · .jpg · .jpeg · .webp · .bmp</p>
             <p className="small dim">
               点击选择文件 · <a className="link" onClick={event => { event.stopPropagation(); window.translator.chooseTarget('folder').then(begin) }}>选择文件夹</a>
             </p>
+            {history.length > 0 && (
+              <div className="history">
+                <p className="small dim">最近翻译</p>
+                {history.slice(0, 5).map(item => (
+                  <button key={item.path} className="historyItem" title={item.path} onClick={event => { event.stopPropagation(); begin(item.path) }}>
+                    {item.path.split(/[\\/]/).pop()}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : status.phase === 'inspect' ? (
           <div className="hint"><p className="big">正在识别…</p>{status.engine && <p className="small">{status.engine}</p>}</div>
@@ -205,8 +257,9 @@ export default function App() {
             <div className="fields">
               <label>API 地址<input value={llm.baseUrl} onChange={event => setLlm({ ...llm, baseUrl: event.target.value })} /></label>
               <label>模型<input value={llm.model} onChange={event => setLlm({ ...llm, model: event.target.value })} /></label>
-              <label>API Key<input type="password" placeholder="必填" value={llm.apiKey} onChange={event => setLlm({ ...llm, apiKey: event.target.value })} /></label>
+              <label>API Key<input type="password" placeholder={hasStoredKey ? '已保存（留空保持不变）' : '必填'} value={llm.apiKey} onChange={event => setLlm({ ...llm, apiKey: event.target.value })} /></label>
               <label>温度<input type="number" min="0" max="2" step="0.1" value={llm.temperature} onChange={event => setLlm({ ...llm, temperature: Number(event.target.value) })} /></label>
+              <p className="note">Key 加密保存在系统凭据区，不以明文存储。</p>
             </div>
           )}
           <p className="label">引擎处理</p>
@@ -218,7 +271,25 @@ export default function App() {
             <input type="radio" checked={preferHook} onChange={() => setPreferHook(true)} />
             <span><b>实时 Hook</b><small>边玩边翻，外挂字幕，马上能玩</small></span>
           </label>
-          <p className="note">翻译结果会缓存到本地，重复内容不再消耗请求。</p>
+          <p className="label">OCR 源语言</p>
+          <label className="radio">
+            <input type="radio" checked={ocrLang === 'jpn+eng'} onChange={() => setOcrLang('jpn+eng')} />
+            <span><b>日语 + 英语</b><small>大多数游戏（默认）</small></span>
+          </label>
+          <label className="radio">
+            <input type="radio" checked={ocrLang === 'kor+eng'} onChange={() => setOcrLang('kor+eng')} />
+            <span><b>韩语 + 英语</b></span>
+          </label>
+          <label className="radio">
+            <input type="radio" checked={ocrLang === 'eng'} onChange={() => setOcrLang('eng')} />
+            <span><b>仅英语</b></span>
+          </label>
+          <p className="label">字幕样式</p>
+          <div className="fields">
+            <label>字号 {overlayPrefs.fontSize}px<input type="range" min="18" max="34" step="1" value={overlayPrefs.fontSize} onChange={event => setOverlayPrefs({ ...overlayPrefs, fontSize: Number(event.target.value) })} /></label>
+            <label>背景不透明度 {Math.round(overlayPrefs.opacity * 100)}%<input type="range" min="30" max="100" step="5" value={Math.round(overlayPrefs.opacity * 100)} onChange={event => setOverlayPrefs({ ...overlayPrefs, opacity: Number(event.target.value) / 100 })} /></label>
+          </div>
+          <p className="note">翻译结果会缓存到本地，重复内容不再消耗请求。字幕为点击穿透，关闭请用「停止」。</p>
         </aside>
       )}
     </div>
