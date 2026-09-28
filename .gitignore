@@ -1,6 +1,11 @@
 node_modules/
 dist/
 dist-electron/
-release/
+release*/
 *.log
 INEEDCHINESE_zh-CN/
+/.workbuddy
+
+# Textractor binaries (run npm run setup:textractor)
+resources/textractor/x86/
+resources/textractor/x64/

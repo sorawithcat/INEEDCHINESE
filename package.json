@@ -1,6 +1,6 @@
 {
   "name": "ineedchinese",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "将应用和游戏文本实时翻译为简体中文的桌面工具",
   "author": "sorawithcat",
@@ -10,6 +10,7 @@
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "tsc && vite build && tsc -p tsconfig.electron.json",
     "start": "electron .",
+    "setup:textractor": "node scripts/fetch-textractor.mjs",
     "dist:win": "npm run build && electron-builder --win nsis portable"
   },
   "dependencies": {
@@ -40,6 +41,9 @@
       "dist-electron/**/*",
       "node_modules/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      { "from": "resources/textractor", "to": "textractor" }
     ],
     "asarUnpack": [
       "node_modules/tesseract.js-core/**/*"

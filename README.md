@@ -1,20 +1,26 @@
 # INEEDCHINESE
 
-Windows 游戏与应用 AI 简体中文翻译工具。拖入游戏后自动识别引擎，用户只需选择最终效果：
+把游戏 .exe 拖进窗口，就自动开始翻译为简体中文。
 
-- **中文补丁**：提取可安全修改的文本，批量翻译、校验、备份并安装；支持恢复原始文件。
-- **无注入字幕**：自动启动并定位游戏窗口，通过 OCR 与外部置顶字幕翻译；不写入、不注入、不 Hook 游戏。
+- 能安全打补丁的引擎（Ren'Py、RPG Maker MV/MZ、TyranoBuilder、TXT/JSON 文本）会自动生成中文补丁，以后直接启动游戏就是中文；可随时一键恢复原文。
+- 其他游戏优先用**文本 Hook**（Textractor，从内存直接抓文本，毫秒级出字幕）；hook 不上时自动切换 OCR 置顶字幕，也可随时手动切换。均不修改游戏文件。
+- 翻译结果缓存在本地，重复文本即时出译，不重复消耗请求。
 
-## 当前自动识别
+## 文本 Hook 注意事项
 
-- Ren’Py：有可读 `.rpy` 源脚本时生成直接文本补丁。
-- RPG Maker MV/MZ：按数据库字段和事件指令生成 JSON 补丁。
-- TyranoBuilder：处理未封包 `.ks` 剧本并保留标签。
-- Unity Mono/IL2CPP：已有 XUnity.AutoTranslator 时进行游戏内替换。
-- TXT/JSON：生成带备份的通用文本补丁。
-- XP3、PCK、RGSS3A、Wolf/Bakin 等封包：使用无注入字幕。
+- Hook 属于进程注入，部分杀毒软件会拦截：请把安装目录下的 `resources/textractor` 加入白名单。
+- 少数带反作弊的游戏无法 hook，45 秒无文本会自动切换 OCR。
+- 字幕没出对话？点「切换文本源」在多路文本间循环。
+- Hook 组件为 Textractor（Chenx221 维护版，GPLv3），首次构建前运行 `npm run setup:textractor` 下载。
 
-补丁模式会在游戏目录创建 `.ineedchinese`，其中保存原文件备份、翻译缓存和 SHA-256 清单。全部翻译和校验完成前不会修改游戏文件。
+## 翻译源
+
+- 默认免费翻译，开箱即用。
+- 设置（右上角齿轮）里可切换 LLM API（DeepSeek 等 OpenAI 兼容服务），长句和剧情文本质量更好。
+
+## 补丁说明
+
+补丁模式在游戏目录创建 `.ineedchinese`，保存原文件备份与 SHA-256 清单。全部翻译校验完成后才写入游戏文件，失败自动回滚。
 
 ## 开发
 
@@ -23,16 +29,9 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-## 构建验证
+## 构建
 
 ```powershell
-npm.cmd run build
+npm.cmd run build    # 类型检查 + 构建
+npm.cmd run dist:win # 打包 Windows 安装包与便携版到 release/
 ```
-
-## Windows 安装包与便携版
-
-```powershell
-npm.cmd run dist:win
-```
-
-输出目录为 `release`。
