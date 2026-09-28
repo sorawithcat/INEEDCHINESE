@@ -633,6 +633,11 @@ app.whenReady().then(() => {
     return index
   })
   ipcMain.handle('use-ocr', () => switchToOcr('已手动切换 OCR 字幕'))
+  ipcMain.handle('translate-text', async (_event, request: { text: string; provider: ProviderSettings }) => {
+    const chunks = textChunks(request.text, 2000)
+    const translated = await translateBatch(chunks, request.provider, { prompt: '将文本翻译为自然的简体中文，保留原文格式、换行与段落。', signal: new AbortController().signal })
+    return { translated: translated.join('') }
+  })
   ipcMain.handle('close-overlay', async () => {
     overlayDismissed = true
     await stopSession()

@@ -45,6 +45,62 @@ body {
 }
 .gear:hover { background: var(--panel); color: var(--text); }
 
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 14px 0;
+}
+.tabs button {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+.pastePanel {
+  flex: 1;
+  margin: 10px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+.pastePanel textarea {
+  flex: 1;
+  min-height: 120px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 12px;
+  font-size: 14px;
+  line-height: 1.6;
+  resize: none;
+  outline: none;
+  font-family: inherit;
+}
+.pastePanel textarea:focus { border-color: var(--accent); }
+.pastePanel .button { margin-top: 0; align-self: flex-end; }
+.pastePanel .button:disabled { opacity: .5; cursor: default; }
+.pasteResult {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  user-select: text;
+  max-height: 40%;
+  overflow: auto;
+}
+
 .dropzone {
   flex: 1;
   margin: 14px;

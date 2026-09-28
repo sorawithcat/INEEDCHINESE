@@ -30,6 +30,7 @@ interface Window {
     restore(target: string): Promise<{ restored: number }>
     switchThread(): Promise<number>
     useOcr(): Promise<void>
+    translateText(request: { text: string; provider: ProviderSettings }): Promise<{ translated: string }>
     closeOverlay(): Promise<void>
     onStatus(callback: (status: Status) => void): () => void
   }

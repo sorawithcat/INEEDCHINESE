@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('translator', {
   restore: (target: string) => ipcRenderer.invoke('restore', target),
   switchThread: () => ipcRenderer.invoke('switch-thread'),
   useOcr: () => ipcRenderer.invoke('use-ocr'),
+  translateText: (request: unknown) => ipcRenderer.invoke('translate-text', request),
   closeOverlay: () => ipcRenderer.invoke('close-overlay'),
   onStatus: (callback: (status: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status)

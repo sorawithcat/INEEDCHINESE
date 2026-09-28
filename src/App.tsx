@@ -16,6 +16,10 @@ export default function App() {
   const [providerKind, setProviderKind] = useState<'google' | 'llm'>(() => localStorage.getItem('provider-kind') === 'llm' ? 'llm' : 'google')
   const [llm, setLlm] = useState<LlmConfig>(() => load('llm-config', defaultLlm))
   const [preferHook, setPreferHook] = useState(() => localStorage.getItem('engine-preference') === 'hook')
+  const [tab, setTab] = useState<'file' | 'text'>('file')
+  const [pasteText, setPasteText] = useState('')
+  const [pasteResult, setPasteResult] = useState('')
+  const [pasteBusy, setPasteBusy] = useState(false)
 
   const provider: ProviderSettings = providerKind === 'google' ? { kind: 'google' } : { kind: 'llm', ...llm }
   const busy = status?.phase === 'inspect' || status?.phase === 'patch' || status?.phase === 'hook' || status?.phase === 'hook-waiting' || status?.phase === 'ocr' || status?.phase === 'ocr-waiting'
@@ -46,6 +50,19 @@ export default function App() {
     } catch (error) { setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) }) }
   }
 
+  async function translatePaste() {
+    const text = pasteText.trim()
+    if (!text || pasteBusy) return
+    if (providerKind === 'llm' && !llm.apiKey) { setSettingsOpen(true); setPasteResult('使用 LLM 翻译前请先在设置里填写 API Key'); return }
+    setPasteBusy(true)
+    setPasteResult('翻译中…')
+    try {
+      const result = await window.translator.translateText({ text, provider })
+      setPasteResult(result.translated)
+    } catch (error) { setPasteResult(error instanceof Error ? error.message : String(error)) }
+    finally { setPasteBusy(false) }
+  }
+
   const progress = status?.phase === 'patch' && status.pending ? Math.round((status.done || 0) / status.pending * 100) : undefined
 
   return (
@@ -65,6 +82,24 @@ export default function App() {
         <button className="gear" title="设置" onClick={() => setSettingsOpen(!settingsOpen)}>⚙</button>
       </header>
 
+      <nav className="tabs">
+        <button className={tab === 'file' ? 'active' : ''} onClick={() => setTab('file')}>拖入文件</button>
+        <button className={tab === 'text' ? 'active' : ''} onClick={() => setTab('text')}>粘贴文本</button>
+      </nav>
+
+      {tab === 'text' ? (
+        <main className="pastePanel">
+          <textarea
+            placeholder="粘贴要翻译的文本…"
+            value={pasteText}
+            onChange={event => setPasteText(event.target.value)}
+          />
+          <button className="button primary" disabled={!pasteText.trim() || pasteBusy} onClick={translatePaste}>
+            {pasteBusy ? '翻译中…' : '翻译'}
+          </button>
+          {pasteResult && <div className="pasteResult">{pasteResult}</div>}
+        </main>
+      ) : (
       <main className="dropzone" onClick={() => { if (!busy) window.translator.chooseTarget().then(begin) }}>
         {!status || status.phase === 'stopped' ? (
           <div className="hint">
@@ -122,7 +157,7 @@ export default function App() {
             <p className="small">{status.message}</p>
             <div className="row">
               {status.patched && <button className="button" onClick={restore}>恢复原文</button>}
-              <button className="button primary" onClick={() => setStatus(undefined)}>翻译下一个游戏</button>
+              <button className="button primary" onClick={() => setStatus(undefined)}>翻译下一项</button>
             </div>
           </div>
         ) : status.phase === 'error' ? (
@@ -136,6 +171,7 @@ export default function App() {
           </div>
         ) : null}
       </main>
+      )}
 
       {settingsOpen && (
         <aside className="drawer">
