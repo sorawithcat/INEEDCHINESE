@@ -10,6 +10,7 @@
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "tsc && vite build && tsc -p tsconfig.electron.json",
     "start": "electron .",
+    "simulate": "node scripts/simulate.cjs",
     "setup:textractor": "node scripts/fetch-textractor.mjs",
     "dist:win": "npm run build && electron-builder --win nsis portable"
   },

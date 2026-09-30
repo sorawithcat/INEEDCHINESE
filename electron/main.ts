@@ -6,14 +6,19 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createWorker, type Worker } from 'tesseract.js'
 import { flushCache, translateBatch, translateOne, type ProviderSettings } from './provider'
-import { HookSession, exeArch } from './hook'
+import { HookSession, exeArch, hookExitReason, type HookHandlers } from './hook'
+
+type OverlayBounds = { x: number; y: number; width: number; height: number }
+type OverlayPrefs = { fontSize: number; opacity: number; bounds?: OverlayBounds }
 
 type StartRequest = {
   targetPath: string
   provider: ProviderSettings
   preferHook?: boolean
   ocrLangs?: string[]
-  overlayPrefs?: { fontSize: number; opacity: number }
+  overlayPrefs?: OverlayPrefs
+  /** 可选的 Textractor 特殊码，自动 hook 不上时手动指定 */
+  hookCode?: string
 }
 type PatchManifest = { version: 1; engine: string; createdAt: string; files: { path: string; created: boolean; originalHash?: string; patchedHash: string }[] }
 
@@ -25,6 +30,7 @@ const imageExts = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp'])
 const execFileAsync = promisify(execFile)
 
 let overlay: BrowserWindow | undefined
+let mainWindow: BrowserWindow | undefined
 let overlayDismissed = false
 let session: AbortController | undefined
 let ocrTimer: NodeJS.Timeout | undefined
@@ -32,22 +38,28 @@ let ocrWorker: Worker | undefined
 let safeWaitTimer: NodeJS.Timeout | undefined
 let hook: HookSession | undefined
 let hookFallbackTimer: NodeJS.Timeout | undefined
+let hookCountdownTimer: NodeJS.Timeout | undefined
 let hookThreads = new Map<string, { lastText: string; score: number }>()
 let hookActiveHandle: string | undefined
 let hookLastForwarded = ''
 let hookContext: { event: Electron.IpcMainInvokeEvent; request: StartRequest; signal: AbortSignal } | undefined
 let hookTriedLaunch = false
 let hookGotText = false
+/** Hook 无文本自动回退 OCR 的等待秒数 */
+const HOOK_FALLBACK_SECONDS = 20
 
 function sha256(data: Buffer | string) {
   return crypto.createHash('sha256').update(data).digest('hex')
 }
 
+/** 值得翻译的字符：拉丁、日文假名、CJK（含扩展 B）、谚文、全角符号 */
+const readable = /[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\uFF01-\uFF60\u{20000}-\u{2FA1F}]/u
+
 function shouldTranslate(text: string) {
   const value = text.trim()
   if (value.length < 2 || /^[-+]?\d+(?:\.\d+)?$/.test(value)) return false
   if (/^[\w./\\:-]+\.(?:png|jpe?g|webp|ogg|mp3|wav|json|js|dll|exe)$/i.test(value)) return false
-  return /[A-Za-z぀-ヿ㐀-鿿가-힯]/.test(value)
+  return readable.test(value)
 }
 
 // ---------- 引擎识别 ----------
@@ -56,7 +68,9 @@ function detect(files: string[], target: string) {
   const names = files.map(file => file.toLowerCase())
   if (names.some(file => file.endsWith('.rpy') || file.endsWith('.rpyc')) || names.some(file => /[\\/]renpy[\\/]/.test(file))) return 'Ren\'Py'
   if (names.some(file => file.endsWith('gameassembly.dll')) && names.some(file => file.endsWith('global-metadata.dat'))) return 'Unity IL2CPP'
-  if (names.some(file => file.includes('unityplayer.dll')) || names.some(file => file.includes('_data'))) return 'Unity Mono'
+  // 只认 Unity 自己的标志物：早先用 `includes('_data')` 会把 save_data/ 这类普通目录误判成 Unity 游戏，
+  // 结果纯文本项目被当成游戏拖进 Hook / OCR 流程。
+  if (names.some(file => file.endsWith('unityplayer.dll')) || names.some(file => /[\\/][^\\/]+_data[\\/]globalgamemanagers/.test(file))) return 'Unity Mono'
   if (names.some(file => file.endsWith('.xp3')) || names.some(file => file.endsWith('krkrsteam.dll'))) return 'Kirikiri/KAG'
   if (names.some(file => file.endsWith('tyrano.js')) || names.some(file => /[\\/]tyrano[\\/]/.test(file))) return 'TyranoBuilder'
   if (names.some(file => /(?:rpg_|rmmz_)(?:core|managers)/.test(file))) return 'RPG Maker MV/MZ'
@@ -70,9 +84,12 @@ function detect(files: string[], target: string) {
 async function inspectTarget(target: string) {
   const root = (await fs.stat(target)).isFile() ? path.dirname(target) : target
   const all: string[] = []
+  // 全局截断标记：原来只 return 当前目录，递归会继续，上限形同虚设导致大目录扫描很久
+  let capped = false
   async function scan(dir: string) {
     for (const item of await fs.readdir(dir, { withFileTypes: true })) {
-      if (all.length >= 5000) return
+      if (capped) return
+      if (all.length >= 5000) { capped = true; return }
       if (['node_modules', '.git', '.ineedchinese', 'INEEDCHINESE_zh-CN'].includes(item.name)) continue
       const full = path.join(dir, item.name)
       if (item.isDirectory()) await scan(full)
@@ -138,13 +155,46 @@ function collectRpgStrings(root: unknown) {
 }
 
 type TextEncoding = 'utf8' | 'utf8bom' | 'utf16le' | 'utf16be'
+
+/**
+ * 猜一下非 Unicode 文本到底是什么编码，只用来把报错写具体。
+ * 绝不能用它做自动转换：同一段字节在 GBK / Big5 / EUC-KR 下往往都能"合法"解码，
+ * 猜错就会把整份原文按错编码写回，直接毁掉游戏文本。
+ */
+function sniffLegacyEncoding(data: Buffer) {
+  const sample = data.subarray(0, 65536)
+  const decode = (label: string) => {
+    try {
+      const text = new TextDecoder(label).decode(sample)
+      if (!text || text.includes('\uFFFD')) return undefined
+      const ratio = (text.match(/[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/gu) || []).length / text.length
+      return ratio >= 0.2 ? text : undefined
+    } catch { return undefined }
+  }
+  const sjis = decode('shift_jis')
+  const gbk = decode('gb18030')
+  const big5 = decode('big5')
+  // 能解出全角假名基本可以断定是日文旧编码（GBK/Big5 的字节不会解出假名）
+  if (sjis && /[\u3040-\u30FF]/.test(sjis)) return 'Shift-JIS（日文）'
+  // Big5 能解、GBK 解不出，是繁体文本的典型特征
+  if (big5 && !gbk) return 'Big5（繁体）'
+  if (gbk) return 'GBK / GB18030'
+  if (sjis) return 'Shift-JIS'
+  return undefined
+}
+
 async function readTextStrict(file: string): Promise<{ text: string; encoding: TextEncoding }> {
   const data = await fs.readFile(file)
   if (data[0] === 0xef && data[1] === 0xbb && data[2] === 0xbf) return { text: new TextDecoder('utf-8', { fatal: true }).decode(data.subarray(3)), encoding: 'utf8bom' }
   if (data[0] === 0xff && data[1] === 0xfe) return { text: new TextDecoder('utf-16le', { fatal: true }).decode(data.subarray(2)), encoding: 'utf16le' }
   if (data[0] === 0xfe && data[1] === 0xff) return { text: new TextDecoder('utf-16be', { fatal: true }).decode(data.subarray(2)), encoding: 'utf16be' }
   try { return { text: new TextDecoder('utf-8', { fatal: true }).decode(data), encoding: 'utf8' } }
-  catch { throw new Error(`不支持的文本编码，已拒绝修改：${file}`) }
+  catch {
+    const guess = sniffLegacyEncoding(data)
+    throw new Error(guess
+      ? `该文件不是 UTF-8/UTF-16 文本，看起来是 ${guess} 编码。译文是简体中文，写回旧编码会破坏原文，已跳过：${file}`
+      : `不支持的文本编码，已拒绝修改：${file}`)
+  }
 }
 
 function encodeText(text: string, encoding: TextEncoding) {
@@ -268,6 +318,7 @@ async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<Ret
       if (carriedPaths.has(path.relative(info.root, file))) continue
       const decoded = await readTextStrict(file)
       const relative = path.relative(info.root, file)
+      if (!decoded.text.trim()) continue
       if (path.extname(file).toLowerCase() === '.json') {
         const json = JSON.parse(decoded.text) as unknown
         const entries = jsonStrings(json).filter(entry => shouldTranslate(entry.value))
@@ -336,6 +387,8 @@ async function restorePatch(target: string) {
     else await fs.copyFile(safeRelativePath(path.join(internal, 'backup'), entry.path), destination)
   }
   await fs.unlink(manifestPath)
+  // staging 与 backup 都归 .ineedchinese 所有，清干净，不留残骸
+  await fs.rm(internal, { recursive: true, force: true }).catch(() => undefined)
   return { restored: manifest.files.length }
 }
 
@@ -344,28 +397,165 @@ async function readManifest(root: string): Promise<PatchManifest | undefined> {
   catch { return undefined }
 }
 
+/**
+ * 逐个校验清单里的文件是否还是补丁版（绝对路径 → 是否完好）。
+ * 有清单不等于补丁还在：文件被删、被改、或游戏更新覆盖过，都必须重新处理。
+ */
+async function verifyManifest(root: string, manifest: PatchManifest) {
+  const intact = new Map<string, boolean>()
+  for (const entry of manifest.files) {
+    let ok = false
+    try {
+      const abs = safeRelativePath(root, entry.path)
+      if (await fs.stat(abs).then(() => true).catch(() => false)) ok = sha256(await fs.readFile(abs)) === entry.patchedHash
+    } catch { ok = false }
+    intact.set(path.resolve(root, entry.path), ok)
+  }
+  return intact
+}
+
 // ---------- 字幕窗 ----------
 
-let overlayPrefs = { fontSize: 24, opacity: 0.9 }
+const OVERLAY_WIDTH = 1000
+const OVERLAY_HEIGHT = 200
+/** 顶部工具栏高度，也是「鼠标移进来就临时解除穿透」的判定区 */
+const OVERLAY_BAR_HEIGHT = 32
+
+let overlayPrefs: OverlayPrefs = { fontSize: 24, opacity: 0.9 }
+let overlayWatchTimer: NodeJS.Timeout | undefined
+let overlayLockTimer: NodeJS.Timeout | undefined
+let overlayUnlocked = false
+/** 最后一次上屏的字幕，用于关闭字幕窗后重新显示 */
+let lastSubtitle = { source: '', translated: '' }
+
+/** 字幕窗页面（data URL）：顶部工具栏带拖拽把手与样式/文本源/关闭按钮，其余区域显示译文。 */
+const overlayHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Microsoft YaHei",sans-serif;color:#fff;border-radius:14px;overflow:hidden;background:rgba(8,12,18,.9);-webkit-user-select:none}
+.bar{height:${OVERLAY_BAR_HEIGHT}px;display:flex;align-items:center;gap:6px;padding:0 10px;opacity:.2;transition:opacity .15s}
+body.hot .bar{opacity:1}
+.grip{flex:1;height:100%;display:flex;align-items:center;gap:8px;font-size:11px;color:#8b95a3;cursor:move;-webkit-app-region:drag}
+.grip::before{content:"";width:46px;height:4px;border-radius:2px;background:#5a6675}
+.bar button{-webkit-app-region:no-drag;width:26px;height:20px;border:0;border-radius:5px;background:#233043;color:#c9d3e0;font-size:12px;line-height:1;cursor:pointer}
+.bar button:hover{background:#31435c}
+.content{padding:0 18px 14px;max-height:${OVERLAY_HEIGHT - OVERLAY_BAR_HEIGHT}px;overflow:hidden}
+#zh{font-size:24px;line-height:1.5}
+#src{font-size:12px;color:#9ca3af;margin-top:8px}
+</style></head><body>
+<div class="bar">
+<div class="grip">字幕</div>
+<button id="fontDown" title="减小字号">A-</button>
+<button id="fontUp" title="放大字号">A+</button>
+<button id="opacity" title="切换背景不透明度">◐</button>
+<button id="thread" title="切换文本源">⇄</button>
+<button id="close" title="关闭字幕">✕</button>
+</div>
+<div class="content"><div id="zh"></div><div id="src"></div></div>
+<script>
+var prefs={fontSize:24,opacity:0.9};
+window.__incSetPrefs=function(p){prefs=p||prefs;document.getElementById('zh').style.fontSize=prefs.fontSize+'px';document.body.style.background='rgba(8,12,18,'+prefs.opacity+')'};
+function push(p){window.translator.setOverlayPrefs(p)};
+document.getElementById('fontUp').onclick=function(){push({fontSize:prefs.fontSize+2,opacity:prefs.opacity})};
+document.getElementById('fontDown').onclick=function(){push({fontSize:prefs.fontSize-2,opacity:prefs.opacity})};
+document.getElementById('opacity').onclick=function(){push({fontSize:prefs.fontSize,opacity:prefs.opacity>=1?0.5:Math.round((prefs.opacity+0.15)*20)/20})};
+document.getElementById('thread').onclick=function(){window.translator.switchThread()};
+document.getElementById('close').onclick=function(){window.translator.closeOverlay()};
+window.__incSetPrefs(prefs);
+</script></body></html>`
+
+function defaultOverlayBounds(): OverlayBounds {
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize
+  return { x: Math.round((width - OVERLAY_WIDTH) / 2), y: height - 260, width: OVERLAY_WIDTH, height: OVERLAY_HEIGHT }
+}
+
+/** 存下来的位置可能来自另一套显示器布局；完全落在屏幕外就退回默认位置，否则用户再也拖不回来 */
+function sanitizeOverlayBounds(bounds?: OverlayBounds): OverlayBounds {
+  if (!bounds) return defaultOverlayBounds()
+  const area = screen.getDisplayMatching(bounds).workArea
+  const visibleWidth = Math.min(bounds.x + bounds.width, area.x + area.width) - Math.max(bounds.x, area.x)
+  const visibleHeight = Math.min(bounds.y + bounds.height, area.y + area.height) - Math.max(bounds.y, area.y)
+  return visibleWidth > 240 && visibleHeight >= OVERLAY_BAR_HEIGHT ? bounds : defaultOverlayBounds()
+}
+
+/** 光标是否落在字幕窗顶部工具栏判定区 */
+function cursorOnOverlayBar() {
+  if (!overlay || overlay.isDestroyed()) return false
+  const point = screen.getCursorScreenPoint()
+  const bounds = overlay.getBounds()
+  return point.x >= bounds.x && point.x <= bounds.x + bounds.width && point.y >= bounds.y && point.y <= bounds.y + OVERLAY_BAR_HEIGHT
+}
+
+function pushOverlayPrefs() {
+  if (!overlay || overlay.isDestroyed()) return
+  overlay.webContents.executeJavaScript(`window.__incSetPrefs && window.__incSetPrefs(${JSON.stringify({ fontSize: overlayPrefs.fontSize, opacity: overlayPrefs.opacity })})`).catch(() => undefined)
+}
+
+/** 穿透 / 可交互 切换：解锁后工具栏可拖可点，锁定后点击重新穿透到游戏 */
+function setOverlayUnlocked(unlocked: boolean) {
+  if (!overlay || overlay.isDestroyed()) return
+  overlayUnlocked = unlocked
+  overlay.setIgnoreMouseEvents(!unlocked, { forward: true })
+  // 无边框窗口拖动依赖窗口能收鼠标事件与获得焦点；showInactive 保证不夺走游戏键盘焦点
+  overlay.setFocusable(unlocked)
+  overlay.webContents.executeJavaScript(`document.body.classList.toggle('hot', ${unlocked})`).catch(() => undefined)
+}
+
+/**
+ * 轮询光标位置：进入顶部工具栏区临时解除穿透，移出后恢复。
+ * 用轮询而不是转发 mousemove，是因为穿透窗口本身收不到 mousedown，轮询行为更确定。
+ */
+function startOverlayWatch() {
+  if (overlayWatchTimer) return
+  overlayWatchTimer = setInterval(() => {
+    if (!overlay || overlay.isDestroyed()) return
+    if (cursorOnOverlayBar()) {
+      if (overlayLockTimer) { clearTimeout(overlayLockTimer); overlayLockTimer = undefined }
+      if (!overlayUnlocked) setOverlayUnlocked(true)
+    } else if (overlayUnlocked && !overlayLockTimer) {
+      // 延迟锁定，避免贴着边界移动时反复切换
+      overlayLockTimer = setTimeout(() => {
+        overlayLockTimer = undefined
+        if (!cursorOnOverlayBar()) setOverlayUnlocked(false)
+      }, 150)
+    }
+  }, 60)
+}
+
+function stopOverlayWatch() {
+  if (overlayWatchTimer) clearInterval(overlayWatchTimer)
+  overlayWatchTimer = undefined
+  if (overlayLockTimer) clearTimeout(overlayLockTimer)
+  overlayLockTimer = undefined
+  overlayUnlocked = false
+}
 
 function showOverlay(source: string, translated: string) {
+  lastSubtitle = { source, translated }
   if (overlayDismissed) return
   if (!overlay || overlay.isDestroyed()) {
-    const { width, height } = screen.getPrimaryDisplay().workAreaSize
+    const bounds = sanitizeOverlayBounds(overlayPrefs.bounds)
     overlay = new BrowserWindow({
-      width: 1000, height: 200,
-      x: Math.round((width - 1000) / 2), y: height - 260,
+      ...bounds,
       transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
-      focusable: false, resizable: false,
+      focusable: false, resizable: false, movable: true,
       webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
     })
-    // 点击穿透：不抢游戏焦点，关闭走主窗口「停止」
+    // 默认点击穿透，不抢游戏焦点；鼠标移到顶部工具栏时由 startOverlayWatch 临时解锁
     overlay.setIgnoreMouseEvents(true, { forward: true })
-    overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent('<style>*{box-sizing:border-box}body{margin:0;color:white;font-family:"Microsoft YaHei";border-radius:14px;overflow:hidden;padding:14px 22px}.content{max-height:172px;overflow:hidden}#zh{line-height:1.5}#src{font-size:12px;color:#9ca3af;margin-top:8px}</style><div class="content"><div id="zh"></div><div id="src"></div></div>')}`)
+    overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml)}`)
+    overlay.on('moved', () => {
+      if (!overlay || overlay.isDestroyed()) return
+      const { x, y, width, height } = overlay.getBounds()
+      overlayPrefs.bounds = { x, y, width, height }
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-bounds', overlayPrefs.bounds)
+    })
+    overlay.on('closed', () => { stopOverlayWatch(); overlay = undefined })
     overlay.once('ready-to-show', () => showOverlay(source, translated))
+    startOverlayWatch()
     return
   }
-  overlay.webContents.executeJavaScript(`document.getElementById('zh').textContent=${JSON.stringify(translated)};document.getElementById('src').textContent=${JSON.stringify(source)};document.getElementById('zh').style.fontSize='${overlayPrefs.fontSize}px';document.body.style.background='rgba(8,12,18,${overlayPrefs.opacity})'`)
+  overlay.webContents.executeJavaScript(`document.getElementById('zh').textContent=${JSON.stringify(translated)};document.getElementById('src').textContent=${JSON.stringify(source)}`).catch(() => undefined)
+  pushOverlayPrefs()
   overlay.showInactive()
 }
 
@@ -420,11 +610,16 @@ async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartReques
       const context = history.slice(-5).join('\n')
       const prompt = `${storyPrompt}\n以下为此前识别文本，仅用于理解上下文：\n${context}`
       const { translated, cached } = await translateOne(text, request.provider, { prompt, signal })
-      history.push(text)
+      remember(history, text)
       showOverlay(text, translated)
       event.sender.send('status', { phase: 'ocr', source: text, translated, cached })
     } catch (error) {
-      if (!signal.aborted) event.sender.send('status', { phase: 'error', message: error instanceof Error ? error.message : String(error) })
+      if (!signal.aborted) {
+        const message = error instanceof Error ? error.message : String(error)
+        // 与 Hook 模式一致：翻译失败要在字幕上看得见，而不是静默不动
+        if (previous) showOverlay(previous, `翻译失败：${message}`)
+        event.sender.send('status', { phase: 'error', message })
+      }
     } finally { processing = false }
   }
   ocrTimer = setInterval(() => void tick(), 1800)
@@ -450,7 +645,11 @@ async function windowTitlesForExecutable(executable?: string) {
 }
 
 async function startOcrMode(event: Electron.IpcMainInvokeEvent, request: StartRequest, signal: AbortSignal) {
+  // 连点「改用 OCR」会重复进入这里；不复用旧定时器就会叠加多个轮询、重复截图与重复请求
+  if (safeWaitTimer) { clearInterval(safeWaitTimer); safeWaitTimer = undefined }
+  if (signal.aborted) return
   const executable = await findLaunchTarget(request.targetPath)
+  if (signal.aborted) return
   const expected = executable ? path.basename(executable, '.exe').toLowerCase().replace(/\W/g, '') : ''
   const baseline = new Set((await desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 64, height: 64 } })).map(source => source.id))
   let processTitles: string[] = []
@@ -465,6 +664,7 @@ async function startOcrMode(event: Electron.IpcMainInvokeEvent, request: StartRe
     })
   }
   const existing = await findMatch()
+  if (signal.aborted) return
   if (existing) {
     await startOcr(event, { ...request, sourceId: existing.id, sourceMatch: existing.name.toLowerCase().replace(/\W/g, '') || expected }, signal)
     return
@@ -487,11 +687,18 @@ async function startOcrMode(event: Electron.IpcMainInvokeEvent, request: StartRe
 // ---------- 文本 Hook（Textractor） ----------
 
 function cjkScore(text: string) {
-  return (text.match(/[぀-ヿ㐀-鿿가-힯]/g) || []).length
+  return (text.match(/[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]/gu) || []).length
 }
 
 let hookQueue: Promise<void> = Promise.resolve()
 const hookHistory: string[] = []
+/** 上下文只取最近 5 条，但历史上限放宽一些，避免长会话无限增长 */
+const HISTORY_LIMIT = 50
+
+function remember(arr: string[], text: string) {
+  arr.push(text)
+  if (arr.length > HISTORY_LIMIT) arr.splice(0, arr.length - HISTORY_LIMIT)
+}
 
 function forwardHookText(text: string, cached = false) {
   // 串行队列：防止并发请求乱序上字幕、触发限流
@@ -501,33 +708,44 @@ function forwardHookText(text: string, cached = false) {
 async function doForwardHookText(text: string, cached: boolean) {
   const context = hookContext
   if (!context || context.signal.aborted) return
-  hookLastForwarded = text
   const { event, request, signal } = context
   try {
     const history = hookHistory.slice(-5).join('\n')
     const prompt = `${storyPrompt}\n只翻译台词/界面文本，忽略乱码与控制符。${history ? `\n以下为此前文本，仅用于理解上下文：\n${history}` : ''}`
     const result = await translateOne(text, request.provider, { prompt, signal })
-    hookHistory.push(text)
+    remember(hookHistory, text)
     showOverlay(text, result.translated)
     event.sender.send('status', { phase: 'hook', source: text, translated: result.translated, cached: cached || result.cached })
   } catch (error) {
-    if (!signal.aborted) event.sender.send('status', { phase: 'error', message: error instanceof Error ? error.message : String(error) })
+    if (signal.aborted) return
+    const message = error instanceof Error ? error.message : String(error)
+    // 字幕窗上明示失败原因，否则用户只会觉得「字幕根本没翻译」
+    showOverlay(text, `翻译失败：${message}`)
+    event.sender.send('status', { phase: 'error', message, detail: message })
   }
+}
+
+function clearHookTimers() {
+  if (hookFallbackTimer) clearTimeout(hookFallbackTimer)
+  hookFallbackTimer = undefined
+  if (hookCountdownTimer) clearInterval(hookCountdownTimer)
+  hookCountdownTimer = undefined
 }
 
 function switchToOcr(message: string) {
   const context = hookContext
   if (!context || context.signal.aborted) return
-  hook?.kill(); hook = undefined
-  if (hookFallbackTimer) clearTimeout(hookFallbackTimer); hookFallbackTimer = undefined
+  void hook?.kill()
+  hook = undefined
+  clearHookTimers()
   context.event.sender.send('status', { phase: 'ocr-waiting', message })
   void startOcrMode(context.event, context.request, context.signal)
 }
 
-/** Hook 优先的实时翻译：attach 已运行游戏 → 失败则启动游戏 → 45 秒无文本回退 OCR */
-async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartRequest, signal: AbortSignal) {
+/** Hook 优先的实时翻译：attach 已运行游戏 → 进程未运行则启动游戏 → 20 秒无文本回退 OCR */
+async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartRequest, signal: AbortSignal, engine: string) {
   const executable = await findLaunchTarget(request.targetPath)
-  if (!executable) { startOcrMode(event, request, signal); return }
+  if (!executable) { await startOcrMode(event, request, signal); return }
   let arch: 'x86' | 'x64'
   try { arch = await exeArch(executable) } catch { arch = 'x64' }
   hookContext = { event, request, signal }
@@ -538,7 +756,26 @@ async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartR
   hookGotText = false
   hookQueue = Promise.resolve()
   hookHistory.length = 0
-  event.sender.send('status', { phase: 'hook-waiting', message: '正在注入文本 Hook…' })
+  const send = (data: Record<string, unknown>) => { if (!event.sender.isDestroyed()) event.sender.send('status', { phase: 'hook-waiting', engine, ...data }) }
+  send({ message: '正在注入文本 Hook…' })
+
+  // CLI 的诊断只写 stderr，之前完全没读：既看不到失败原因，管道写满还会把子进程卡死
+  let lastLog = ''
+  let lastError = ''
+  const waiting = () => (hookGotText ? 'Hook 已连接，等待游戏文本…' : '正在注入文本 Hook…')
+
+  /** 重新计时回退：启动游戏那一路要额外等游戏把引擎 DLL 加载完，给更长的窗口 */
+  const armFallback = (seconds: number) => {
+    clearHookTimers()
+    let remaining = seconds
+    hookCountdownTimer = setInterval(() => {
+      if (hookGotText || signal.aborted) return
+      remaining -= 1
+      if (remaining <= 0) return
+      send({ message: `${waiting()} 仍无文本，${remaining} 秒后自动切换 OCR` })
+    }, 1000)
+    hookFallbackTimer = setTimeout(() => { if (!hookGotText) switchToOcr('Hook 未捕获到文本，已切换 OCR 字幕') }, seconds * 1000)
+  }
 
   const onText = (line: { handle: string; text: string }) => {
     const record = hookThreads.get(line.handle)
@@ -551,31 +788,44 @@ async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartR
       if (challenger > Math.max(current * 1.5, current + 30)) hookActiveHandle = line.handle
     }
     if (line.handle !== hookActiveHandle || line.text === hookLastForwarded) return
+    // 立刻记录：去重必须在入队前完成，否则队列积压时同一句会被重复入队
+    hookLastForwarded = line.text
     if (!hookGotText) {
       hookGotText = true
-      if (hookFallbackTimer) clearTimeout(hookFallbackTimer); hookFallbackTimer = undefined
-      event.sender.send('status', { phase: 'hook-waiting', message: 'Hook 已连接，等待游戏文本…' })
+      clearHookTimers()
+      send({ message: 'Hook 已连接，等待游戏文本…' })
     }
     void forwardHookText(line.text)
   }
 
-  const onExit = () => {
-    if (signal.aborted || hookGotText) return
-    hook?.kill(); hook = undefined
-    if (!hookTriedLaunch) {
-      // 游戏未在运行，启动它
-      hookTriedLaunch = true
-      event.sender.send('status', { phase: 'hook-waiting', message: '正在启动游戏并注入 Hook…' })
-      hook = new HookSession(arch)
-      hook.launch(executable, onText, onExit)
-    } else {
-      switchToOcr('文本 Hook 注入失败，已切换 OCR 字幕')
-    }
+  const handlers: HookHandlers = {
+    onText,
+    onLog: line => {
+      lastLog = line.replace(/^(?:\[info\]|error:)\s*/i, '')
+      // -i 启动时的 banner 也是 stderr，不能把它当成失败原因引用
+      if (/^error:/i.test(line)) lastError = lastLog
+      send({ message: waiting(), detail: lastError || lastLog })
+    },
+    onExit: code => {
+      if (signal.aborted || hookGotText) return
+      void hook?.kill()
+      hook = undefined
+      // 仅「未找到进程」才由 CLI 启动游戏，避免注入失败（架构不符/被拦截）时又拉起第二个实例
+      if (code === 3 && !hookTriedLaunch) {
+        hookTriedLaunch = true
+        send({ message: '游戏未运行，正在启动并注入 Hook…', detail: lastError || lastLog || undefined })
+        hook = new HookSession(arch)
+        hook.launch(executable, handlers, request.hookCode)
+        armFallback(HOOK_FALLBACK_SECONDS + 15)
+        return
+      }
+      switchToOcr(`${hookExitReason(code)}${lastError ? `：${lastError}` : ''}，已切换 OCR 字幕`)
+    },
   }
 
   hook = new HookSession(arch)
-  hook.attach(path.basename(executable), onText, onExit)
-  hookFallbackTimer = setTimeout(() => { if (!hookGotText) switchToOcr('Hook 未捕获到文本，已切换 OCR 字幕') }, 45000)
+  hook.attach(path.basename(executable), handlers, request.hookCode)
+  armFallback(HOOK_FALLBACK_SECONDS)
 }
 
 /** 循环切换有文本的线程 */
@@ -626,13 +876,15 @@ async function stopSession() {
   ocrTimer = undefined
   if (safeWaitTimer) clearInterval(safeWaitTimer)
   safeWaitTimer = undefined
-  if (hookFallbackTimer) clearTimeout(hookFallbackTimer)
-  hookFallbackTimer = undefined
-  hook?.kill()
+  clearHookTimers()
+  // 等 CLI 自己 detach 完再往下走，否则 will-quit 里的 app.exit 会把优雅流程掐断
+  const activeHook = hook
   hook = undefined
+  await activeHook?.kill()
   hookContext = undefined
   hookThreads = new Map()
   hookActiveHandle = undefined
+  stopOverlayWatch()
   overlay?.close()
   overlay = undefined
 }
@@ -674,11 +926,13 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
     const manifest = await readManifest(info.root)
     let covered = false
     if (manifest) {
-      if (isSingleTextFile) covered = manifest.files.some(entry => path.resolve(info.root, entry.path) === path.resolve(request.targetPath))
+      const intact = await verifyManifest(info.root, manifest)
+      const patched = (file: string) => intact.get(path.resolve(file)) === true
+      if (isSingleTextFile) covered = patched(request.targetPath)
       else if (info.type === '通用文本项目' || info.type === 'Windows 应用') {
         const textFiles = info.files.filter(file => supported.has(path.extname(file).toLowerCase()))
-        covered = textFiles.length > 0 && textFiles.every(file => manifest.files.some(entry => path.resolve(info.root, entry.path) === path.resolve(file)))
-      } else covered = true
+        covered = textFiles.length > 0 && textFiles.every(patched)
+      } else covered = manifest.files.length > 0 && [...intact.values()].every(Boolean)
     }
     if (covered && manifest) {
       if (isSingleTextFile) void shell.openPath(path.resolve(request.targetPath))
@@ -698,13 +952,15 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
       } catch (error) {
         if (signal.aborted) throw error
         if (!(error instanceof Error && error.message === 'NO_PATCHABLE_TEXT')) throw error
+        // 纯文本项目没有游戏进程可 hook，回退到 OCR 只会一直等窗口，直接给出明确结果
+        if (isTextProject) { send({ phase: 'done', engine: info.type, message: '没有找到可翻译的文本' }); return }
         // 提取不到可补丁文本，回退到 OCR 字幕
       }
     }
 
     if (signal.aborted) throw new Error('已取消')
     send({ phase: 'hook-waiting', engine: info.type, message: '正在定位游戏进程…' })
-    await startHookMode(event, request, signal)
+    await startHookMode(event, request, signal, info.type)
   } catch (error) {
     if (signal.aborted || (error instanceof Error && error.message === '已取消')) send({ phase: 'stopped', message: '已停止' })
     else send({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
@@ -714,7 +970,8 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
 // ---------- 窗口与 IPC ----------
 
 // 单实例：重复启动时聚焦已有窗口
-if (!app.requestSingleInstanceLock()) app.quit()
+const singleInstance = app.requestSingleInstanceLock()
+if (!singleInstance) app.quit()
 app.on('second-instance', () => {
   const win = BrowserWindow.getAllWindows()[0]
   if (win) { if (win.isMinimized()) win.restore(); win.focus() }
@@ -723,11 +980,15 @@ app.on('second-instance', () => {
 function createWindow() {
   const win = new BrowserWindow({ width: 720, height: 540, minWidth: 560, minHeight: 440, backgroundColor: '#101418', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } })
   win.setMenuBarVisibility(false)
+  mainWindow = win
+  win.on('closed', () => { if (mainWindow === win) mainWindow = undefined })
   if (!app.isPackaged) win.loadURL('http://localhost:5173')
   else win.loadFile(path.join(__dirname, '../dist/index.html'))
 }
 
 app.whenReady().then(() => {
+  // 没抢到单实例锁时 app.quit() 未必立刻生效，这里再拦一次，避免闪出一个窗口
+  if (!singleInstance) return
   ipcMain.handle('choose-target', async (_event, mode?: string) => {
     const options: Electron.OpenDialogOptions = mode === 'folder'
       ? { properties: ['openDirectory'] }
@@ -739,7 +1000,11 @@ app.whenReady().then(() => {
   ipcMain.handle('restore', async (_event, target: string) => restorePatch(target))
   ipcMain.handle('switch-thread', event => {
     const index = switchThread()
-    if (index) event.sender.send('status', { phase: 'hook-waiting', message: `已切换到文本源 ${index}` })
+    // 已经有译文时不再重置主窗口卡片（正在播放的字幕本身就是反馈）
+    if (!hookGotText) {
+      const target = event.sender === mainWindow?.webContents ? event.sender : mainWindow?.webContents
+      if (target && !target.isDestroyed()) target.send('status', { phase: 'hook-waiting', message: index ? `已切换到文本源 ${index}` : '没有其他文本源可切换' })
+    }
     return index
   })
   ipcMain.handle('use-ocr', () => switchToOcr('已手动切换 OCR 字幕'))
@@ -755,14 +1020,26 @@ app.whenReady().then(() => {
   ipcMain.handle('close-overlay', async () => {
     // 只关字幕窗，翻译会话继续（停止走主窗口按钮）
     overlayDismissed = true
+    stopOverlayWatch()
     overlay?.close()
     overlay = undefined
   })
+  ipcMain.handle('show-overlay', async () => {
+    // 字幕窗被 ✕ 关掉后翻译还在跑，需要一个入口把它叫回来（否则会话期间再也看不到字幕）
+    overlayDismissed = false
+    if (lastSubtitle.translated) showOverlay(lastSubtitle.source, lastSubtitle.translated)
+  })
   ipcMain.handle('set-overlay-prefs', (_event, prefs: { fontSize: number; opacity: number }) => {
-    overlayPrefs = prefs
-    if (overlay && !overlay.isDestroyed()) {
-      overlay.webContents.executeJavaScript(`document.getElementById('zh')&&(document.getElementById('zh').style.fontSize='${prefs.fontSize}px');document.body.style.background='rgba(8,12,18,${prefs.opacity})'`).catch(() => undefined)
+    const next: OverlayPrefs = {
+      ...overlayPrefs,
+      fontSize: Math.min(34, Math.max(18, Math.round(prefs.fontSize))),
+      opacity: Math.min(1, Math.max(0.3, prefs.opacity)),
     }
+    const changed = next.fontSize !== overlayPrefs.fontSize || next.opacity !== overlayPrefs.opacity
+    overlayPrefs = next
+    pushOverlayPrefs()
+    // 从字幕工具栏改的样式同步回主窗口，让 localStorage 也跟着记住
+    if (changed && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-prefs', { fontSize: next.fontSize, opacity: next.opacity })
   })
   ipcMain.handle('save-llm-config', async (_event, config: LlmStored) => { await writeLlmConfig(config); return { hasKey: Boolean(config.apiKey) } })
   ipcMain.handle('get-llm-config', async () => {

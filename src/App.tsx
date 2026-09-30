@@ -13,6 +13,13 @@ function loadList<T>(key: string): T[] {
   try { const value = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(value) ? value : [] } catch { return [] }
 }
 
+function loadBounds(): OverlayBounds | undefined {
+  try {
+    const value = JSON.parse(localStorage.getItem('overlay-bounds') || 'null') as OverlayBounds | null
+    return value && typeof value.x === 'number' && typeof value.y === 'number' ? value : undefined
+  } catch { return undefined }
+}
+
 export default function App() {
   const [target, setTarget] = useState<string>()
   const [status, setStatus] = useState<Status>()
@@ -23,7 +30,9 @@ export default function App() {
   const [hasStoredKey, setHasStoredKey] = useState(false)
   const [preferHook, setPreferHook] = useState(() => localStorage.getItem('engine-preference') === 'hook')
   const [ocrLang, setOcrLang] = useState(() => localStorage.getItem('ocr-lang') || 'jpn+eng')
+  const [hookCode, setHookCode] = useState(() => localStorage.getItem('hook-code') || '')
   const [overlayPrefs, setOverlayPrefs] = useState<OverlayPrefs>(() => load('overlay-prefs', { fontSize: 24, opacity: 0.9 }))
+  const [overlayBounds, setOverlayBounds] = useState<OverlayBounds | undefined>(loadBounds)
   const [history, setHistory] = useState<HistoryItem[]>(() => loadList('history'))
   const [tab, setTab] = useState<'file' | 'text'>('file')
   const [pasteText, setPasteText] = useState('')
@@ -34,9 +43,19 @@ export default function App() {
   const busy = status?.phase === 'inspect' || status?.phase === 'patch' || status?.phase === 'hook' || status?.phase === 'hook-waiting' || status?.phase === 'ocr' || status?.phase === 'ocr-waiting'
 
   useEffect(() => window.translator.onStatus(setStatus), [])
+  // 字幕窗被拖动：位置由主进程回传，这里只负责持久化
+  useEffect(() => window.translator.onOverlayBounds(bounds => {
+    setOverlayBounds(bounds)
+    localStorage.setItem('overlay-bounds', JSON.stringify(bounds))
+  }), [])
+  // 字幕工具栏改了字号/不透明度：值没变时保持原对象，避免 effect 回传造成循环
+  useEffect(() => window.translator.onOverlayPrefs(prefs => {
+    setOverlayPrefs(prev => prev.fontSize === prefs.fontSize && prev.opacity === prefs.opacity ? prev : { ...prev, ...prefs })
+  }), [])
   useEffect(() => localStorage.setItem('provider-kind', providerKind), [providerKind])
   useEffect(() => localStorage.setItem('engine-preference', preferHook ? 'hook' : 'patch'), [preferHook])
   useEffect(() => localStorage.setItem('ocr-lang', ocrLang), [ocrLang])
+  useEffect(() => localStorage.setItem('hook-code', hookCode), [hookCode])
   useEffect(() => localStorage.setItem('overlay-prefs', JSON.stringify(overlayPrefs)), [overlayPrefs])
   useEffect(() => { void window.translator.setOverlayPrefs(overlayPrefs) }, [overlayPrefs])
   useEffect(() => localStorage.setItem('history', JSON.stringify(history)), [history])
@@ -73,7 +92,16 @@ export default function App() {
     setTarget(path)
     setStatus({ phase: 'inspect' })
     setHistory(items => [{ path, time: Date.now() }, ...items.filter(item => item.path !== path)].slice(0, 10))
-    try { await window.translator.start({ targetPath: path, provider, preferHook, ocrLangs: ocrLang.split('+'), overlayPrefs }) }
+    try {
+      await window.translator.start({
+        targetPath: path,
+        provider,
+        preferHook,
+        ocrLangs: ocrLang.split('+'),
+        overlayPrefs: { ...overlayPrefs, bounds: overlayBounds },
+        hookCode: hookCode.trim() || undefined,
+      })
+    }
     catch (error) { setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) }) }
   }
 
@@ -176,6 +204,7 @@ export default function App() {
           <div className="hint" onClick={event => event.stopPropagation()}>
             <p className="big">{status.engine || '文本 Hook'}</p>
             <p className="small">{status.message || '正在注入文本 Hook…'}</p>
+            {status.detail && <p className="small dim detail">{status.detail}</p>}
             <div className="row">
               <button className="button" onClick={() => window.translator.useOcr()}>改用 OCR</button>
               <button className="button danger" onClick={stop}>停止</button>
@@ -188,6 +217,7 @@ export default function App() {
             {status.translated && <p className="translated">{status.translated}</p>}
             <div className="row">
               <button className="button" onClick={() => window.translator.switchThread()}>切换文本源</button>
+              <button className="button" onClick={() => window.translator.showOverlay()}>显示字幕</button>
               <button className="button" onClick={() => window.translator.useOcr()}>改用 OCR</button>
               <button className="button danger" onClick={stop}>停止</button>
             </div>
@@ -203,7 +233,10 @@ export default function App() {
             <p className="big">字幕运行中 <span className="live">●</span></p>
             {status.source && <p className="source">{status.source}</p>}
             {status.translated && <p className="translated">{status.translated}</p>}
-            <button className="button danger" onClick={stop}>停止</button>
+            <div className="row">
+              <button className="button" onClick={() => window.translator.showOverlay()}>显示字幕</button>
+              <button className="button danger" onClick={stop}>停止</button>
+            </div>
           </div>
         ) : status.phase === 'done' ? (
           <div className="hint wide" onClick={event => event.stopPropagation()}>
@@ -229,6 +262,7 @@ export default function App() {
           <div className="hint" onClick={event => event.stopPropagation()}>
             <p className="big error">出错了</p>
             <p className="small">{status.message}</p>
+            {status.detail && status.detail !== status.message && <p className="small dim detail">{status.detail}</p>}
             <div className="row">
               <button className="button primary" onClick={() => begin(target)}>重试</button>
               <button className="button" onClick={() => setStatus(undefined)}>返回</button>
@@ -271,6 +305,10 @@ export default function App() {
             <input type="radio" checked={preferHook} onChange={() => setPreferHook(true)} />
             <span><b>实时 Hook</b><small>边玩边翻，外挂字幕，马上能玩</small></span>
           </label>
+          <div className="fields">
+            <label>Hook 特殊码（可选）<input value={hookCode} placeholder="留空自动识别，如 HSN-8@0" onChange={event => setHookCode(event.target.value)} /></label>
+            <p className="note">自动 Hook 抓不到台词时再填。Textractor 界面里「Add hook」用的那串代码，直接粘贴即可。</p>
+          </div>
           <p className="label">OCR 源语言</p>
           <label className="radio">
             <input type="radio" checked={ocrLang === 'jpn+eng'} onChange={() => setOcrLang('jpn+eng')} />
@@ -289,7 +327,7 @@ export default function App() {
             <label>字号 {overlayPrefs.fontSize}px<input type="range" min="18" max="34" step="1" value={overlayPrefs.fontSize} onChange={event => setOverlayPrefs({ ...overlayPrefs, fontSize: Number(event.target.value) })} /></label>
             <label>背景不透明度 {Math.round(overlayPrefs.opacity * 100)}%<input type="range" min="30" max="100" step="5" value={Math.round(overlayPrefs.opacity * 100)} onChange={event => setOverlayPrefs({ ...overlayPrefs, opacity: Number(event.target.value) / 100 })} /></label>
           </div>
-          <p className="note">翻译结果会缓存到本地，重复内容不再消耗请求。字幕为点击穿透，关闭请用「停止」。</p>
+          <p className="note">翻译结果会缓存到本地，重复内容不再消耗请求。字幕平时点击穿透；把鼠标移到字幕顶部，工具栏就会亮起，可以拖动、调样式或关闭。</p>
         </aside>
       )}
     </div>

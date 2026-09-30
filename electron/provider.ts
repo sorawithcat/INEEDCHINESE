@@ -174,6 +174,8 @@ export async function translateBatch(
   await loadCache()
   const keyOf = (text: string) => cacheKey(settings, text, ctx.prompt)
   const keys = texts.map(keyOf)
+  // 空 / 纯空白直接当作自身译文：送进翻译通道只会让整批报「全部通道失败」
+  texts.forEach((text, position) => { if (!text.trim()) cache.set(keys[position], text) })
   const missing: { position: number; text: string }[] = []
   const seen = new Map<string, number>()
   texts.forEach((text, position) => {
