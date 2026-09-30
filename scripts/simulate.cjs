@@ -21,9 +21,16 @@ const results = []
 // ---------- 假 screen ----------
 let cursor = { x: 0, y: 0 }
 const screenStub = {
-  getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1040 } }),
+  getPrimaryDisplay: () => ({ workAreaSize: { width: 1920, height: 1040 }, workArea: { x: 0, y: 0, width: 1920, height: 1040 } }),
   getCursorScreenPoint: () => ({ ...cursor }),
-  getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1040 } }),
+  getDisplayMatching: rect => {
+    const displays = screenStub.getAllDisplays()
+    return displays.find(item => rect.x >= item.bounds.x && rect.x < item.bounds.x + item.bounds.width) ?? displays[0]
+  },
+  getAllDisplays: () => [
+    { id: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, workArea: { x: 0, y: 0, width: 1920, height: 1040 } },
+    { id: 2, bounds: { x: 1920, y: 0, width: 1920, height: 1080 }, workArea: { x: 1920, y: 0, width: 1920, height: 1040 } },
+  ],
 }
 
 // ---------- 假 BrowserWindow ----------
@@ -42,20 +49,47 @@ class FakeBrowserWindow extends EventEmitter {
     this.destroyed = false
     this.mouse = []      // setIgnoreMouseEvents 调用序列
     this.focusable = []
+    this.opacity = []
+    this.topLevel = []
+    this.hidden = false
     this.webContents = new FakeWebContents(this)
     windows.push(this)
   }
   setMenuBarVisibility() {}
   setIgnoreMouseEvents(v, opts) { this.mouse.push(v === true ? '穿透' : '可点'); if (opts) this.hadOpts = true }
   setFocusable(v) { this.focusable.push(v) }
+  setOpacity(v) { this.opacity.push(v) }
+  setAlwaysOnTop(v, level) { this.topLevel.push(level ?? true) }
+  hide() { this.hidden = true }
+  show() { this.hidden = false }
+  focus() {}
+  restore() {}
+  isMinimized() { return false }
   loadURL(url) { this.loadedUrl = url; setImmediate(() => this.emit('ready-to-show')); return Promise.resolve() }
   loadFile(f) { this.loadedFile = f; return Promise.resolve() }
   getBounds() { return { ...this.bounds } }
+  setBounds(next) { this.bounds = { ...this.bounds, ...next }; this.emit('moved') }
   close() { this.destroyed = true; this.emit('closed') }
-  showInactive() {}
+  showInactive() { this.hidden = false }
   isDestroyed() { return this.destroyed }
   // 模拟窗口被拖动
   moveTo(x, y) { this.bounds.x = x; this.bounds.y = y; this.emit('moved') }
+}
+
+// ---------- 假桌面捕获 ----------
+let frameSalt = 0
+let toPngCount = 0
+const croppedRects = []
+function makeFakeSource(name, id, displayId) {
+  const size = { width: 1920, height: 1080 }
+  const image = {
+    getSize: () => ({ ...size }),
+    crop: rect => { croppedRects.push(rect); return image },
+    resize: () => image,
+    toBitmap: () => Buffer.from(`frame-${frameSalt}`),
+    toPNG: () => { toPngCount++; return Buffer.from(`png-${frameSalt}`) },
+  }
+  return { id, name, display_id: displayId, thumbnail: image }
 }
 
 // ---------- 假 desktopCapturer ----------
@@ -121,6 +155,15 @@ const tesseractStub = {
 
 // ---------- 假 electron ----------
 const ipcHandlers = new Map()
+const trays = []
+const shortcuts = new Map()
+class FakeTray extends EventEmitter {
+  constructor(icon) { super(); this.icon = icon }
+  setToolTip() {}
+  setContextMenu(menu) { this.menu = menu; trays.push(this) }
+}
+let saveDialogPath = ''
+let openDialogPath = ''
 const electronStub = {
   app: {
     isPackaged: false,
@@ -130,11 +173,18 @@ const electronStub = {
   },
   BrowserWindow: FakeBrowserWindow,
   desktopCapturer: desktopCapturerStub,
-  dialog: { showOpenDialog: async () => ({ filePaths: [] }) },
+  dialog: {
+    showOpenDialog: async () => openDialogPath ? { filePaths: [openDialogPath], canceled: false } : { filePaths: [], canceled: true },
+    showSaveDialog: async () => saveDialogPath ? { filePath: saveDialogPath, canceled: false } : { canceled: true },
+  },
   ipcMain: { handle: (channel, fn) => ipcHandlers.set(channel, fn) },
   safeStorage: { isEncryptionAvailable: () => false, encryptString: () => Buffer.from(''), decryptString: () => '' },
   screen: screenStub,
   shell: { openPath: async () => '' },
+  Tray: FakeTray,
+  Menu: { buildFromTemplate: template => ({ template }) },
+  nativeImage: { createFromPath: () => ({ isEmpty: () => false, resize: () => ({}) }), createEmpty: () => ({ isEmpty: () => true }) },
+  globalShortcut: { register: (accelerator, callback) => { shortcuts.set(accelerator, callback); return true }, unregisterAll: () => shortcuts.clear() },
 }
 
 // ---------- 拦截 require ----------
@@ -155,7 +205,12 @@ let statuses = []
 function makeEvent() {
   return { sender: { isDestroyed: () => false, send: (ch, data) => { statuses.push(data); record('  status:', JSON.stringify(data)) } } }
 }
-function reset() { statuses = []; windows.length = 0; spawned.length = 0; getSourcesCalls.length = 0; ocrRecognizeCount = 0; cursor = { x: 0, y: 0 } }
+function reset() {
+  statuses = []; windows.length = 0; spawned.length = 0; getSourcesCalls.length = 0
+  ocrRecognizeCount = 0; cursor = { x: 0, y: 0 }
+  toPngCount = 0; croppedRects.length = 0; frameSalt = 0
+  fakeSources = []
+}
 const invoke = (channel, ...args) => ipcHandlers.get(channel)(makeEvent(), ...args)
 function assert(name, ok, extra = '') { results.push({ name, ok, extra }); record(`${ok ? '  PASS' : '  FAIL'} ${name} ${extra}`) }
 
@@ -568,6 +623,139 @@ async function main() {
   const cost23 = Date.now() - t23
   assert('停止会等 CLI 退出，而不是写完 quit 就返回', cost23 >= 250, `stop 耗时 ${cost23}ms`)
   quitDelayMs = 5
+
+  // ============ 场景 24：术语表 ============
+  record('==== 场景 24：术语表 ====')
+  reset()
+  spawnBehaviour = 'stream'
+  await invoke('start', {
+    targetPath: gameExe, provider: { kind: 'google' }, preferHook: true,
+    glossary: [{ from: 'こんにちは', to: '您好呀' }],
+  })
+  const c24 = spawned[0]
+  c24.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] こんにちは世界')
+  await sleep(220)
+  const hook24 = statuses.find(s => s.phase === 'hook')
+  assert('术语按指定译文还原', String(hook24?.translated).includes('您好呀'), JSON.stringify(hook24))
+  assert('占位符不会漏进译文', !String(hook24?.translated).includes('{T0}'), JSON.stringify(hook24))
+  await invoke('stop')
+
+  // ============ 场景 25：缓存键不受上下文影响 ============
+  record('==== 场景 25：同句跨上下文命中缓存 ====')
+  reset()
+  spawnBehaviour = 'stream'
+  await invoke('start', { targetPath: gameExe, provider: { kind: 'google' }, preferHook: true })
+  const c25 = spawned[0]
+  c25.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] おなじ台詞')
+  await sleep(220)
+  c25.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] べつの台詞')
+  await sleep(220)
+  c25.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] おなじ台詞')
+  await sleep(220)
+  const repeat25 = statuses.filter(s => s.phase === 'hook' && s.source === 'おなじ台詞').pop()
+  assert('同一句换了上下文仍命中缓存', repeat25?.cached === true, JSON.stringify(repeat25))
+  await invoke('stop')
+
+  // ============ 场景 26：等待期摆窗 + 多行字幕 ============
+  record('==== 场景 26：等待期摆窗与多行字幕 ====')
+  reset()
+  spawnBehaviour = 'stream'
+  await invoke('start', { targetPath: gameExe, provider: { kind: 'google' }, preferHook: true, overlayPrefs: { fontSize: 24, opacity: 0.9, lines: 3, idleSeconds: 0 } })
+  const early = windows.find(w => w.loadedUrl)
+  assert('等待期就已经摆出字幕窗', !!early, `窗口数=${windows.length}`)
+  const c26 = spawned[0]
+  c26.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] いちばんめ')
+  await sleep(180)
+  c26.emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] にばんめ')
+  await sleep(180)
+  const rendered = String(early?.webContents.scripts.filter(s => s.includes('__incRender')).pop())
+  assert('多行字幕一次渲染两条', rendered.includes('いちばんめ') && rendered.includes('にばんめ'), rendered.slice(0, 160))
+  await invoke('stop')
+
+  // ============ 场景 27：OCR 帧去重 + 识别区裁剪 + 副屏落点 ============
+  record('==== 场景 27：OCR 帧去重与裁剪 ====')
+  reset()
+  spawnBehaviour = 'stream'
+  fakeSources = [makeFakeSource('MyGame', 'window:1', '2')]
+  await invoke('start', { targetPath: gameExe, provider: { kind: 'google' }, preferHook: true, overlayPrefs: { fontSize: 24, opacity: 0.9, lines: 3, idleSeconds: 0 } })
+  await invoke('use-ocr')
+  await sleep(120)
+  const pngAfterFirst = toPngCount
+  const ocrWin = windows.find(w => w.loadedUrl)
+  assert('识别区裁到下半屏', croppedRects.length > 0 && croppedRects[0].y > 0, JSON.stringify(croppedRects[0]))
+  assert('字幕落到游戏所在的副屏', ocrWin?.bounds.x === 2380, JSON.stringify(ocrWin?.bounds))
+  await sleep(2000)   // 第二个 tick 落在同一帧上
+  assert('同一帧不再重复编码 PNG', toPngCount === pngAfterFirst, `toPNG ${pngAfterFirst} → ${toPngCount}`)
+  await invoke('stop')
+
+  // ============ 场景 28：多个 exe 时选对启动目标 ============
+  record('==== 场景 28：多 exe 选择 ====')
+  reset()
+  const namedDir = path.join(WORK, 'MyGame')
+  fs.mkdirSync(namedDir, { recursive: true })
+  fs.writeFileSync(path.join(namedDir, 'MyGame.exe'), Buffer.alloc(64, 1))
+  fs.writeFileSync(path.join(namedDir, 'huge-tool.exe'), Buffer.alloc(4096, 1))
+  spawnBehaviour = 'stream'
+  await invoke('start', { targetPath: namedDir, provider: { kind: 'google' }, preferHook: true })
+  assert('与目录同名的 exe 优先于体积更大的', String(spawned[0]?.args).includes('MyGame.exe'), JSON.stringify(spawned[0]?.args))
+  await invoke('stop')
+
+  // ============ 场景 29：Kirikiri 散装脚本补丁 ============
+  record('==== 场景 29：Kirikiri 散装 .ks ====')
+  reset()
+  const krkDir = path.join(WORK, 'kirikiri')
+  fs.mkdirSync(path.join(krkDir, 'scenario'), { recursive: true })
+  fs.writeFileSync(path.join(krkDir, 'data.xp3'), Buffer.alloc(16))
+  const krkKs = path.join(krkDir, 'scenario', 'first.ks')
+  fs.writeFileSync(krkKs, '*start\nこんにちは世界\n[cm]\n')
+  await invoke('start', { targetPath: krkDir, provider: { kind: 'google' } })
+  const krkOut = fs.readFileSync(krkKs, 'utf8')
+  assert('KiriKiri 引擎被识别', statuses.some(s => s.engine === 'Kirikiri/KAG'), JSON.stringify(statuses.find(s => s.engine)))
+  assert('散装 .ks 台词已翻译', krkOut.includes('【译】こんにちは世界'), JSON.stringify(krkOut))
+  assert('KAG 命令未被破坏', krkOut.includes('[cm]') && krkOut.startsWith('*start'), JSON.stringify(krkOut))
+
+  reset()
+  const sjisDir = path.join(WORK, 'kirikiri-sjis')
+  fs.mkdirSync(sjisDir, { recursive: true })
+  fs.writeFileSync(path.join(sjisDir, 'game.exe'), Buffer.from([0x4d, 0x5a, ...new Array(0x40).fill(0)]))
+  fs.writeFileSync(path.join(sjisDir, 'data.xp3'), Buffer.alloc(16))
+  const sjisKs = path.join(sjisDir, 's.ks')
+  fs.writeFileSync(sjisKs, Buffer.from([0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd]))
+  await invoke('start', { targetPath: sjisDir, provider: { kind: 'google' } })
+  assert('Shift-JIS 脚本整体放弃补丁', !statuses.some(s => s.phase === 'patch'), JSON.stringify(statuses.map(s => s.phase)))
+  assert('Shift-JIS 脚本未被改写', fs.readFileSync(sjisKs).length === 10, '')
+  await invoke('stop')
+
+  // ============ 场景 30：空闲自动压暗 ============
+  record('==== 场景 30：空闲压暗 ====')
+  reset()
+  spawnBehaviour = 'stream'
+  await invoke('start', { targetPath: gameExe, provider: { kind: 'google' }, preferHook: true, overlayPrefs: { fontSize: 24, opacity: 0.9, lines: 3, idleSeconds: 1 } })
+  spawned[0].emitLine('[1:2A4C:7FF6A1B20000:0:0:main:HSN-8@0] あかるい')
+  await sleep(200)
+  const win30 = windows.find(w => w.loadedUrl)
+  assert('有译文时保持不透明', win30?.opacity[win30.opacity.length - 1] === 1, JSON.stringify(win30?.opacity))
+  await sleep(1400)
+  assert('空闲后自动压暗', win30?.opacity[win30.opacity.length - 1] === 0.25, JSON.stringify(win30?.opacity))
+  await invoke('stop')
+
+  // ============ 场景 31：托盘与全局快捷键 ============
+  record('==== 场景 31：托盘与快捷键 ====')
+  assert('托盘已创建', trays.length === 1, `托盘数=${trays.length}`)
+  assert('全局快捷键已注册', shortcuts.has('CommandOrControl+Alt+S') && shortcuts.has('CommandOrControl+Alt+D'), [...shortcuts.keys()].join(','))
+
+  // ============ 场景 32：翻译记忆导出导入 ============
+  record('==== 场景 32：翻译记忆导出导入 ====')
+  saveDialogPath = path.join(WORK, 'memory.json')
+  const exported = await invoke('export-cache')
+  assert('导出写出翻译记忆文件', exported.saved > 0 && fs.existsSync(saveDialogPath), JSON.stringify(exported))
+  saveDialogPath = ''
+  const mergeFile = path.join(WORK, 'memory-extra.json')
+  fs.writeFileSync(mergeFile, JSON.stringify({ deadbeefdeadbeef: '新增译文' }))
+  openDialogPath = mergeFile
+  const imported = await invoke('import-cache')
+  assert('导入只补空缺', imported.added === 1, JSON.stringify(imported))
+  openDialogPath = ''
 
   // ---------- 汇总 ----------
   record('')

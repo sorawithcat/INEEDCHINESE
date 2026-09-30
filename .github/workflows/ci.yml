@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # tsc + vite + tsc(electron)
+      - run: npm run build
+
+      # scripts/simulate.cjs：拦截 electron / child_process / tesseract 驱动真实主进程代码，
+      # 覆盖引擎识别、补丁与恢复、Hook 全链路、字幕窗、编码等；失败会以非 0 退出
+      - run: npm run simulate

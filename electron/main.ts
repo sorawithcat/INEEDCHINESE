@@ -1,26 +1,69 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage, screen, shell } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, globalShortcut, ipcMain, Menu, nativeImage, safeStorage, screen, shell, Tray } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { createWorker, type Worker } from 'tesseract.js'
-import { flushCache, translateBatch, translateOne, type ProviderSettings } from './provider'
+import { exportCache, flushCache, importCache, translateBatch, translateOne, type ProviderSettings } from './provider'
 import { HookSession, exeArch, hookExitReason, type HookHandlers } from './hook'
 
 type OverlayBounds = { x: number; y: number; width: number; height: number }
-type OverlayPrefs = { fontSize: number; opacity: number; bounds?: OverlayBounds }
+type OverlayPrefs = {
+  fontSize: number
+  opacity: number
+  /** 字幕保留几行（1-5） */
+  lines?: number
+  /** 多少秒没有新译文就把字幕压暗，0 = 不淡出 */
+  idleSeconds?: number
+  bounds?: OverlayBounds
+}
 
 type StartRequest = {
   targetPath: string
   provider: ProviderSettings
   preferHook?: boolean
   ocrLangs?: string[]
+  /** OCR 识别区域：默认只认窗口下半屏，避免把桌面和其它 UI 文字也送去识别 */
+  ocrRegion?: 'lower' | 'full'
   overlayPrefs?: OverlayPrefs
   /** 可选的 Textractor 特殊码，自动 hook 不上时手动指定 */
   hookCode?: string
+  /** 术语表：命中的词按指定译文输出，不再交给翻译通道 */
+  glossary?: GlossaryEntry[]
 }
 type PatchManifest = { version: 1; engine: string; createdAt: string; files: { path: string; created: boolean; originalHash?: string; patchedHash: string }[] }
+type GlossaryEntry = { from: string; to: string }
+
+// ---------- 术语表 ----------
+
+/**
+ * 术语表用占位符实现：翻前把术语换成 {T0} 这类标记，翻完再还原成指定译文。
+ * 直接把译文塞进原文再翻译是行不通的——整句以中文为主时，自动检测语种会把整句判成中文而不翻。
+ */
+function buildGlossary(entries?: GlossaryEntry[]) {
+  const list = (entries || [])
+    .map((item, index) => ({ from: (item.from || '').trim(), to: item.to ?? '', token: `{T${index}}` }))
+    .filter(item => item.from)
+  if (!list.length) return undefined
+  // 长词优先替换，避免「阿斯特拉」被「阿斯特」抢先切掉
+  const byLength = [...list].sort((a, b) => b.from.length - a.from.length)
+  return {
+    size: list.length,
+    // 术语表变了就得让缓存失效，所以把内容摘要带去缓存键
+    id: crypto.createHash('sha256').update(JSON.stringify(list.map(item => [item.from, item.to]))).digest('hex').slice(0, 8),
+    mask: (text: string) => {
+      let output = text
+      for (const item of byLength) if (output.includes(item.from)) output = output.split(item.from).join(item.token)
+      return output
+    },
+    restore: (text: string) => {
+      let output = text
+      for (const item of list) if (output.includes(item.token)) output = output.split(item.token).join(item.to)
+      return output
+    },
+  }
+}
 
 const storyPrompt = '将游戏文本翻译为自然的简体中文。保留人物语气、世界观术语和情绪，不擅自增删内容。'
 const uiPrompt = '将界面文本翻译为简洁准确的简体中文，按钮文字简短，术语前后一致。'
@@ -31,6 +74,9 @@ const execFileAsync = promisify(execFile)
 
 let overlay: BrowserWindow | undefined
 let mainWindow: BrowserWindow | undefined
+let tray: Tray | undefined
+/** 从托盘退出时不要再被「有会话就隐藏窗口」拦下来 */
+let forceClose = false
 let overlayDismissed = false
 let session: AbortController | undefined
 let ocrTimer: NodeJS.Timeout | undefined
@@ -73,6 +119,8 @@ function detect(files: string[], target: string) {
   if (names.some(file => file.endsWith('unityplayer.dll')) || names.some(file => /[\\/][^\\/]+_data[\\/]globalgamemanagers/.test(file))) return 'Unity Mono'
   if (names.some(file => file.endsWith('.xp3')) || names.some(file => file.endsWith('krkrsteam.dll'))) return 'Kirikiri/KAG'
   if (names.some(file => file.endsWith('tyrano.js')) || names.some(file => /[\\/]tyrano[\\/]/.test(file))) return 'TyranoBuilder'
+  // 散装的 .tjs / .ks 说明脚本没封进 xp3，这时可以像普通文本项目一样直接打补丁
+  if (names.some(file => file.endsWith('.tjs')) || names.some(file => file.endsWith('.ks'))) return 'Kirikiri/KAG'
   if (names.some(file => /(?:rpg_|rmmz_)(?:core|managers)/.test(file))) return 'RPG Maker MV/MZ'
   if (names.some(file => file.endsWith('.pck')) || names.some(file => file.endsWith('godot.dll'))) return 'Godot'
   if (names.some(file => file.endsWith('game.rgss3a')) || names.some(file => file.endsWith('rgss301.dll'))) return 'RPG Maker VX Ace'
@@ -236,7 +284,7 @@ async function stagePatchFile(root: string, file: string, content: string | Buff
 
 // ---------- 补丁模式 ----------
 
-async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<ReturnType<typeof inspectTarget>>, provider: ProviderSettings, signal: AbortSignal) {
+async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<ReturnType<typeof inspectTarget>>, provider: ProviderSettings, signal: AbortSignal, glossary?: ReturnType<typeof buildGlossary>) {
   const prompt = ["Ren'Py", 'TyranoBuilder', 'RPG Maker MV/MZ'].includes(info.type) ? storyPrompt : uiPrompt
   const internal = path.join(info.root, '.ineedchinese')
   const backup = path.join(internal, 'backup')
@@ -256,8 +304,12 @@ async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<Ret
   const carriedPaths = new Set(carried.map(entry => entry.path))
   const report = (file: string, current: number, total: number, done = 0, pending = 0) =>
     event.sender.send('status', { phase: 'patch', engine: info.type, file, current, total, done, pending })
-  const run = (texts: string[], onProgress?: (done: number, total: number) => void) =>
-    translateBatch(texts, provider, { prompt, signal }, onProgress)
+  const run = (texts: string[], onProgress?: (done: number, total: number) => void) => {
+    if (!glossary) return translateBatch(texts, provider, { prompt, signal }, onProgress)
+    // 术语先换成占位符，翻完再还原；占位符也进缓存键，术语表变了缓存自然失效
+    return translateBatch(texts.map(glossary.mask), provider, { prompt, signal, cachePrompt: `${prompt}\n#glossary:${glossary.id}` }, onProgress)
+      .then(result => result.map(glossary.restore))
+  }
 
   if (info.type === 'Ren\'Py') {
     const game = path.join(info.root, 'game')
@@ -308,6 +360,31 @@ async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<Ret
       indexes.forEach((item, itemIndex) => { const indent = item.line.match(/^\s*/)?.[0] || ''; lines[item.lineIndex] = indent + translated[itemIndex] })
       await stagePatchFile(info.root, file, encodeText(lines.join(newline), decoded.encoding), manifest, internal)
     }
+  } else if (info.type === 'Kirikiri/KAG') {
+    // 只支持散装 .ks；脚本封在 .xp3 里时这里找不到文件，会自动退回 Hook 字幕
+    const files = await collectFiles(info.root, '.ks')
+    if (!files.length) throw new Error('NO_PATCHABLE_TEXT')
+    // KiriKiri 的 .ks 常是 Shift-JIS，而译文是简体中文根本写不回去。
+    // 只要有一个脚本不是 Unicode 就整体放弃，免得打出半中半日的补丁。
+    const decodedAll: { file: string; text: string; encoding: TextEncoding }[] = []
+    for (const file of files) {
+      try {
+        const decoded = await readTextStrict(file)
+        decodedAll.push({ file, text: decoded.text, encoding: decoded.encoding })
+      } catch { throw new Error('NO_PATCHABLE_TEXT') }
+    }
+    for (let index = 0; index < decodedAll.length; index++) {
+      if (signal.aborted) throw new Error('已取消')
+      const { file, text, encoding } = decodedAll[index]
+      if (carriedPaths.has(path.relative(info.root, file))) continue
+      const newline = text.includes('\r\n') ? '\r\n' : '\n'
+      const lines = text.split(/\r?\n/)
+      const targets = lines.map((line, lineIndex) => ({ line, lineIndex })).filter(({ line }) => { const value = line.trim(); return Boolean(value) && !/^[;*@#\[]/.test(value) && shouldTranslate(value) })
+      if (!targets.length) continue
+      const translated = await run(targets.map(item => item.line.trim()), (done, total) => report(path.relative(info.root, file), index + 1, decodedAll.length, done, total))
+      targets.forEach((item, itemIndex) => { const indent = item.line.match(/^\s*/)?.[0] || ''; lines[item.lineIndex] = indent + translated[itemIndex] })
+      await stagePatchFile(info.root, file, encodeText(lines.join(newline), encoding), manifest, internal)
+    }
   } else {
     const files = (await fs.stat(info.target)).isFile() && supported.has(path.extname(info.target).toLowerCase())
       ? [info.target]
@@ -353,7 +430,8 @@ async function createPatch(event: Electron.IpcMainInvokeEvent, info: Awaited<Ret
         if (!await fs.stat(saved).then(() => true).catch(() => false)) { await fs.mkdir(path.dirname(saved), { recursive: true }); await fs.copyFile(original, saved) }
       }
       await fs.mkdir(path.dirname(original), { recursive: true })
-      await fs.copyFile(staged, original)
+      // staging 与目标同盘，rename 是原子替换，省掉整份再拷一遍
+      await fs.rename(staged, original)
       if (sha256(await fs.readFile(original)) !== entry.patchedHash) throw new Error(`补丁写入校验失败：${entry.path}`)
       applied.push(entry)
     }
@@ -424,48 +502,82 @@ const OVERLAY_BAR_HEIGHT = 32
 let overlayPrefs: OverlayPrefs = { fontSize: 24, opacity: 0.9 }
 let overlayWatchTimer: NodeJS.Timeout | undefined
 let overlayLockTimer: NodeJS.Timeout | undefined
+let overlayIdleTimer: NodeJS.Timeout | undefined
 let overlayUnlocked = false
-/** 最后一次上屏的字幕，用于关闭字幕窗后重新显示 */
-let lastSubtitle = { source: '', translated: '' }
+/** 手动锁定（想框选复制时）就不再因鼠标移开而恢复穿透 */
+let overlayPinned = false
+/** 最近几条字幕，关闭字幕窗后重新显示也用它 */
+let overlayLines: { source: string; translated: string; error?: boolean }[] = []
+/** 还没有任何译文时显示的占位文案 */
+let overlayStatus = ''
+const OVERLAY_MAX_LINES = 5
+/** 游戏窗口所在的显示器矩形，字幕默认落在这块屏上 */
+let lastGameRect: Electron.Rectangle | undefined
 
-/** 字幕窗页面（data URL）：顶部工具栏带拖拽把手与样式/文本源/关闭按钮，其余区域显示译文。 */
+/** 字幕窗页面（data URL）：顶部工具栏 + 多行字幕。译文用 textContent 写入，不拼 HTML。 */
 const overlayHtml = `<!doctype html><html><head><meta charset="utf-8"><style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Microsoft YaHei",sans-serif;color:#fff;border-radius:14px;overflow:hidden;background:rgba(8,12,18,.9);-webkit-user-select:none}
+body{font-family:"Microsoft YaHei",sans-serif;color:#fff;font-size:24px;border-radius:14px;overflow:hidden;background:rgba(8,12,18,.9);-webkit-user-select:none}
 .bar{height:${OVERLAY_BAR_HEIGHT}px;display:flex;align-items:center;gap:6px;padding:0 10px;opacity:.2;transition:opacity .15s}
-body.hot .bar{opacity:1}
+body.hot .bar,body.pinned .bar{opacity:1}
 .grip{flex:1;height:100%;display:flex;align-items:center;gap:8px;font-size:11px;color:#8b95a3;cursor:move;-webkit-app-region:drag}
 .grip::before{content:"";width:46px;height:4px;border-radius:2px;background:#5a6675}
 .bar button{-webkit-app-region:no-drag;width:26px;height:20px;border:0;border-radius:5px;background:#233043;color:#c9d3e0;font-size:12px;line-height:1;cursor:pointer}
 .bar button:hover{background:#31435c}
-.content{padding:0 18px 14px;max-height:${OVERLAY_HEIGHT - OVERLAY_BAR_HEIGHT}px;overflow:hidden}
-#zh{font-size:24px;line-height:1.5}
-#src{font-size:12px;color:#9ca3af;margin-top:8px}
+.bar button.on{background:#3b6ea5;color:#fff}
+.lines{padding:0 18px 14px;max-height:${OVERLAY_HEIGHT - OVERLAY_BAR_HEIGHT}px;overflow:hidden;display:flex;flex-direction:column;gap:6px}
+.line:not(:last-child){opacity:.45}
+.zh{line-height:1.45;word-break:break-word}
+.src{font-size:12px;color:#9ca3af;margin-top:2px;word-break:break-word}
+.line.err .zh{color:#fca5a5}
+body.pinned .lines{-webkit-user-select:text;cursor:text}
 </style></head><body>
 <div class="bar">
 <div class="grip">字幕</div>
+<button id="pin" title="锁定后可框选复制">⧉</button>
 <button id="fontDown" title="减小字号">A-</button>
 <button id="fontUp" title="放大字号">A+</button>
 <button id="opacity" title="切换背景不透明度">◐</button>
 <button id="thread" title="切换文本源">⇄</button>
 <button id="close" title="关闭字幕">✕</button>
 </div>
-<div class="content"><div id="zh"></div><div id="src"></div></div>
+<div class="lines" id="lines"></div>
 <script>
-var prefs={fontSize:24,opacity:0.9};
-window.__incSetPrefs=function(p){prefs=p||prefs;document.getElementById('zh').style.fontSize=prefs.fontSize+'px';document.body.style.background='rgba(8,12,18,'+prefs.opacity+')'};
-function push(p){window.translator.setOverlayPrefs(p)};
-document.getElementById('fontUp').onclick=function(){push({fontSize:prefs.fontSize+2,opacity:prefs.opacity})};
-document.getElementById('fontDown').onclick=function(){push({fontSize:prefs.fontSize-2,opacity:prefs.opacity})};
-document.getElementById('opacity').onclick=function(){push({fontSize:prefs.fontSize,opacity:prefs.opacity>=1?0.5:Math.round((prefs.opacity+0.15)*20)/20})};
+var prefs={fontSize:24,opacity:0.9,lines:3};
+var pinned=false;
+function paint(){
+  document.body.style.fontSize=prefs.fontSize+'px';
+  document.body.style.background='rgba(8,12,18,'+prefs.opacity+')';
+  document.body.classList.toggle('pinned',pinned);
+  document.getElementById('pin').classList.toggle('on',pinned);
+}
+window.__incSetPrefs=function(p){if(p)prefs=p;paint()};
+window.__incSetPinned=function(v){pinned=!!v;paint()};
+window.__incRender=function(list){
+  var box=document.getElementById('lines');
+  box.innerHTML='';
+  (list||[]).slice(-prefs.lines).forEach(function(item){
+    var wrap=document.createElement('div');
+    wrap.className='line'+(item.error?' err':'');
+    var zh=document.createElement('div');zh.className='zh';zh.textContent=item.translated||'';
+    wrap.appendChild(zh);
+    if(item.source){var src=document.createElement('div');src.className='src';src.textContent=item.source;wrap.appendChild(src)}
+    box.appendChild(wrap);
+  });
+};
+document.getElementById('pin').onclick=function(){window.translator.setOverlayPinned(!pinned)};
+document.getElementById('fontUp').onclick=function(){window.translator.setOverlayPrefs({fontSize:prefs.fontSize+2,opacity:prefs.opacity,lines:prefs.lines})};
+document.getElementById('fontDown').onclick=function(){window.translator.setOverlayPrefs({fontSize:prefs.fontSize-2,opacity:prefs.opacity,lines:prefs.lines})};
+document.getElementById('opacity').onclick=function(){window.translator.setOverlayPrefs({fontSize:prefs.fontSize,opacity:prefs.opacity>=1?0.5:Math.round((prefs.opacity+0.15)*20)/20,lines:prefs.lines})};
 document.getElementById('thread').onclick=function(){window.translator.switchThread()};
 document.getElementById('close').onclick=function(){window.translator.closeOverlay()};
-window.__incSetPrefs(prefs);
+paint();
 </script></body></html>`
 
-function defaultOverlayBounds(): OverlayBounds {
-  const { width, height } = screen.getPrimaryDisplay().workAreaSize
-  return { x: Math.round((width - OVERLAY_WIDTH) / 2), y: height - 260, width: OVERLAY_WIDTH, height: OVERLAY_HEIGHT }
+/** anchor 是游戏窗口矩形：字幕默认落到游戏所在那块屏，避免多显示器时跑错屏 */
+function defaultOverlayBounds(anchor?: Electron.Rectangle): OverlayBounds {
+  const area = (anchor ? screen.getDisplayMatching(anchor) : screen.getPrimaryDisplay()).workArea
+  return { x: area.x + Math.round((area.width - OVERLAY_WIDTH) / 2), y: area.y + area.height - 260, width: OVERLAY_WIDTH, height: OVERLAY_HEIGHT }
 }
 
 /** 存下来的位置可能来自另一套显示器布局；完全落在屏幕外就退回默认位置，否则用户再也拖不回来 */
@@ -487,7 +599,15 @@ function cursorOnOverlayBar() {
 
 function pushOverlayPrefs() {
   if (!overlay || overlay.isDestroyed()) return
-  overlay.webContents.executeJavaScript(`window.__incSetPrefs && window.__incSetPrefs(${JSON.stringify({ fontSize: overlayPrefs.fontSize, opacity: overlayPrefs.opacity })})`).catch(() => undefined)
+  const payload = { fontSize: overlayPrefs.fontSize, opacity: overlayPrefs.opacity, lines: overlayPrefs.lines ?? 3 }
+  overlay.webContents.executeJavaScript(`window.__incSetPrefs && window.__incSetPrefs(${JSON.stringify(payload)})`).catch(() => undefined)
+}
+
+function renderOverlay() {
+  if (!overlay || overlay.isDestroyed()) return
+  const kept = overlayLines.slice(-(overlayPrefs.lines ?? 3))
+  const payload = kept.length ? kept : (overlayStatus ? [{ source: '', translated: overlayStatus }] : [])
+  overlay.webContents.executeJavaScript(`window.__incRender && window.__incRender(${JSON.stringify(payload)})`).catch(() => undefined)
 }
 
 /** 穿透 / 可交互 切换：解锁后工具栏可拖可点，锁定后点击重新穿透到游戏 */
@@ -498,6 +618,34 @@ function setOverlayUnlocked(unlocked: boolean) {
   // 无边框窗口拖动依赖窗口能收鼠标事件与获得焦点；showInactive 保证不夺走游戏键盘焦点
   overlay.setFocusable(unlocked)
   overlay.webContents.executeJavaScript(`document.body.classList.toggle('hot', ${unlocked})`).catch(() => undefined)
+  if (unlocked) {
+    // 用户正在看/操作，结束淡出
+    if (overlayIdleTimer) { clearTimeout(overlayIdleTimer); overlayIdleTimer = undefined }
+    overlay.setOpacity(1)
+  }
+}
+
+/** 手动锁定：不因鼠标移开而恢复穿透，此时可以框选复制译文 */
+function setOverlayPinned(pinned: boolean) {
+  overlayPinned = pinned
+  if (!overlay || overlay.isDestroyed()) return
+  overlay.webContents.executeJavaScript(`window.__incSetPinned && window.__incSetPinned(${pinned})`).catch(() => undefined)
+  if (pinned && overlayLockTimer) { clearTimeout(overlayLockTimer); overlayLockTimer = undefined }
+  setOverlayUnlocked(pinned || overlayUnlocked)
+}
+
+/** 一段时间没有新译文就把整窗压暗，别一直糊在画面上；有新内容或鼠标进来立刻恢复 */
+function scheduleOverlayIdle() {
+  if (overlayIdleTimer) clearTimeout(overlayIdleTimer)
+  overlayIdleTimer = undefined
+  if (!overlay || overlay.isDestroyed()) return
+  overlay.setOpacity(1)
+  const seconds = overlayPrefs.idleSeconds ?? 10
+  if (!seconds) return
+  overlayIdleTimer = setTimeout(() => {
+    overlayIdleTimer = undefined
+    if (overlay && !overlay.isDestroyed() && !overlayUnlocked) overlay.setOpacity(0.25)
+  }, seconds * 1000)
 }
 
 /**
@@ -507,7 +655,7 @@ function setOverlayUnlocked(unlocked: boolean) {
 function startOverlayWatch() {
   if (overlayWatchTimer) return
   overlayWatchTimer = setInterval(() => {
-    if (!overlay || overlay.isDestroyed()) return
+    if (!overlay || overlay.isDestroyed() || overlayPinned) return
     if (cursorOnOverlayBar()) {
       if (overlayLockTimer) { clearTimeout(overlayLockTimer); overlayLockTimer = undefined }
       if (!overlayUnlocked) setOverlayUnlocked(true)
@@ -515,7 +663,7 @@ function startOverlayWatch() {
       // 延迟锁定，避免贴着边界移动时反复切换
       overlayLockTimer = setTimeout(() => {
         overlayLockTimer = undefined
-        if (!cursorOnOverlayBar()) setOverlayUnlocked(false)
+        if (!overlayPinned && !cursorOnOverlayBar()) setOverlayUnlocked(false)
       }, 150)
     }
   }, 60)
@@ -526,42 +674,87 @@ function stopOverlayWatch() {
   overlayWatchTimer = undefined
   if (overlayLockTimer) clearTimeout(overlayLockTimer)
   overlayLockTimer = undefined
+  if (overlayIdleTimer) clearTimeout(overlayIdleTimer)
+  overlayIdleTimer = undefined
   overlayUnlocked = false
+  overlayPinned = false
 }
 
-function showOverlay(source: string, translated: string) {
-  lastSubtitle = { source, translated }
+/** 建窗；已存在返回 true（调用方直接渲染即可） */
+function ensureOverlay(anchor?: Electron.Rectangle) {
+  if (overlay && !overlay.isDestroyed()) return true
+  const bounds = sanitizeOverlayBounds(overlayPrefs.bounds ?? (anchor ? defaultOverlayBounds(anchor) : undefined))
+  overlay = new BrowserWindow({
+    ...bounds,
+    transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
+    focusable: false, resizable: false, movable: true,
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
+  })
+  // 默认点击穿透，不抢游戏焦点；鼠标移到顶部工具栏时由 startOverlayWatch 临时解锁
+  overlay.setIgnoreMouseEvents(true, { forward: true })
+  // 默认层级会被别的置顶窗口压住，抬到最高一层
+  overlay.setAlwaysOnTop(true, 'screen-saver')
+  overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml)}`)
+  overlay.on('moved', () => {
+    if (!overlay || overlay.isDestroyed()) return
+    const { x, y, width, height } = overlay.getBounds()
+    overlayPrefs.bounds = { x, y, width, height }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-bounds', overlayPrefs.bounds)
+  })
+  overlay.on('closed', () => { stopOverlayWatch(); overlay = undefined })
+  overlay.once('ready-to-show', () => {
+    pushOverlayPrefs()
+    renderOverlay()
+    scheduleOverlayIdle()
+    overlay?.showInactive()
+  })
+  startOverlayWatch()
+  return false
+}
+
+function showOverlay(source: string, translated: string, error = false, anchor?: Electron.Rectangle) {
+  overlayStatus = ''
+  overlayLines.push({ source, translated, error })
+  if (overlayLines.length > OVERLAY_MAX_LINES) overlayLines.splice(0, overlayLines.length - OVERLAY_MAX_LINES)
   if (overlayDismissed) return
-  if (!overlay || overlay.isDestroyed()) {
-    const bounds = sanitizeOverlayBounds(overlayPrefs.bounds)
-    overlay = new BrowserWindow({
-      ...bounds,
-      transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
-      focusable: false, resizable: false, movable: true,
-      webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false },
-    })
-    // 默认点击穿透，不抢游戏焦点；鼠标移到顶部工具栏时由 startOverlayWatch 临时解锁
-    overlay.setIgnoreMouseEvents(true, { forward: true })
-    overlay.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml)}`)
-    overlay.on('moved', () => {
-      if (!overlay || overlay.isDestroyed()) return
-      const { x, y, width, height } = overlay.getBounds()
-      overlayPrefs.bounds = { x, y, width, height }
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-bounds', overlayPrefs.bounds)
-    })
-    overlay.on('closed', () => { stopOverlayWatch(); overlay = undefined })
-    overlay.once('ready-to-show', () => showOverlay(source, translated))
-    startOverlayWatch()
+  if (ensureOverlay(anchor)) {
+    pushOverlayPrefs()
+    renderOverlay()
+    scheduleOverlayIdle()
+    overlay?.showInactive()
+  }
+}
+
+/** 还没有译文时先把字幕窗摆出来，让用户知道它在哪、正在等什么 */
+function showOverlayStatus(text: string, anchor?: Electron.Rectangle) {
+  overlayStatus = text
+  if (overlayDismissed) return
+  if (ensureOverlay(anchor)) {
+    // 窗口已存在：若之前只是用主屏兜底摆着、用户也还没自己拖过，就挪到游戏那块屏
+    if (anchor && !overlayPrefs.bounds && overlay && !overlay.isDestroyed()) {
+      const target = defaultOverlayBounds(anchor)
+      const now = overlay.getBounds()
+      if (now.x !== target.x || now.y !== target.y) overlay.setBounds({ ...now, x: target.x, y: target.y })
+    }
+    pushOverlayPrefs()
+    renderOverlay()
     return
   }
-  overlay.webContents.executeJavaScript(`document.getElementById('zh').textContent=${JSON.stringify(translated)};document.getElementById('src').textContent=${JSON.stringify(source)}`).catch(() => undefined)
   pushOverlayPrefs()
-  overlay.showInactive()
+  renderOverlay()
+  scheduleOverlayIdle()
+  overlay?.showInactive()
 }
 
 // ---------- OCR 实时字幕 ----------
 
 let ocrWorkerLangs: string[] = []
+
+/** 帧指纹：缩到 960 宽再哈希，比整帧 PNG 编码便宜一个量级，细微改动依然能看出差别 */
+function frameFingerprint(image: Electron.NativeImage) {
+  const probe = image.getSize().width > 960 ? image.resize({ width: 960 }) : image
+  return sha256(probe.toBitmap())
+}
 
 async function getOcrWorker(langs: string[]) {
   if (ocrWorker && ocrWorkerLangs.join('+') !== langs.join('+')) {
@@ -575,12 +768,42 @@ async function getOcrWorker(langs: string[]) {
   return ocrWorker
 }
 
-async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartRequest & { sourceId: string; sourceMatch?: string }, signal: AbortSignal) {
+/** 游戏窗口所在显示器的矩形；拿不到返回 undefined，退回主屏默认位置 */
+function displayBoundsOf(displayId?: string): Electron.Rectangle | undefined {
+  if (!displayId) return undefined
+  return screen.getAllDisplays().find(item => String(item.id) === String(displayId))?.bounds
+}
+
+/**
+ * 多显示器时字幕常常跑到主屏去。这里用窗口标题 + 进程路径定位游戏窗口，
+ * 再经 desktopCapturer 的 display_id 拿到它所在的显示器。
+ */
+async function gameDisplayAnchor(executable?: string): Promise<Electron.Rectangle | undefined> {
+  if (!executable) return undefined
+  const expected = path.basename(executable, '.exe').toLowerCase().replace(/\W/g, '')
+  if (!expected) return undefined
+  try {
+    const titles = (await windowTitlesForExecutable(executable)).map(title => title.toLowerCase())
+    const sources = await desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 64, height: 64 } })
+    const source = sources.find(item => {
+      const name = item.name.toLowerCase().replace(/\W/g, '')
+      if (!name || name === 'ineedchinese') return false
+      if (name.includes(expected) || expected.includes(name)) return true
+      return titles.some(title => Boolean(title) && (item.name.toLowerCase() === title || item.name.toLowerCase().includes(title)))
+    })
+    return displayBoundsOf(source?.display_id)
+  } catch { return undefined }
+}
+
+async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartRequest & { sourceId: string; sourceMatch?: string; anchor?: Electron.Rectangle }, signal: AbortSignal) {
   if (ocrTimer) clearInterval(ocrTimer)
   if (!ocrWorker || ocrWorkerLangs.join('+') !== (request.ocrLangs || ['jpn', 'eng']).join('+')) {
     event.sender.send('status', { phase: 'ocr-waiting', message: '正在加载 OCR 模型…' })
   }
   await getOcrWorker(request.ocrLangs || ['jpn', 'eng'])
+  if (request.anchor) lastGameRect = request.anchor
+  // 先把字幕窗摆到游戏那块屏上，等待期也能看到它
+  showOverlayStatus('正在等待画面文字…', lastGameRect)
   let previous = ''
   let previousFrame = ''
   let sourceId = request.sourceId
@@ -597,27 +820,40 @@ async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartReques
       })
       if (!source) { event.sender.send('status', { phase: 'ocr-waiting', message: '游戏窗口已关闭，正在等待重新打开…' }); return }
       sourceId = source.id
-      const image = source.thumbnail.toPNG()
-      const frameHash = sha256(image)
+      const frame = source.thumbnail
+      const size = frame.getSize()
+      if (!size.width || !size.height) return
+      // 台词基本都在窗口下方；整屏 OCR 会把桌面和别的 UI 文字也喂给识别器
+      const top = request.ocrRegion === 'full' ? 0 : Math.round(size.height * 0.55)
+      const cropped = top ? frame.crop({ x: 0, y: top, width: size.width, height: size.height - top }) : frame
+      // 帧指纹走缩放后的位图：比整帧编码 PNG 便宜一个量级，细微改动依然看得出来
+      const frameHash = frameFingerprint(cropped)
       if (frameHash === previousFrame) return
       previousFrame = frameHash
-      const result = await ocrWorker!.recognize(image)
+      const result = await ocrWorker!.recognize(cropped.toPNG())
       // 低置信度帧多为乱字，忽略防止误翻
       if ((result.data.confidence ?? 100) < 55) return
       const text = result.data.text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length >= 2).join('\n').trim()
       if (!text || text === previous) return
       previous = text
+      const glossary = buildGlossary(request.glossary)
+      const base = `${storyPrompt}\n只翻译画面中的台词，保留原文换行，忽略识别噪声。`
       const context = history.slice(-5).join('\n')
-      const prompt = `${storyPrompt}\n以下为此前识别文本，仅用于理解上下文：\n${context}`
-      const { translated, cached } = await translateOne(text, request.provider, { prompt, signal })
+      const prompt = context ? `${base}\n以下为此前识别文本，仅用于理解上下文：\n${context}` : base
+      const outcome = await translateOne(glossary ? glossary.mask(text) : text, request.provider, {
+        prompt,
+        cachePrompt: glossary ? `${base}\n#glossary:${glossary.id}` : base,
+        signal,
+      })
+      const translated = glossary ? glossary.restore(outcome.translated) : outcome.translated
       remember(history, text)
-      showOverlay(text, translated)
-      event.sender.send('status', { phase: 'ocr', source: text, translated, cached })
+      showOverlay(text, translated, false, lastGameRect)
+      event.sender.send('status', { phase: 'ocr', source: text, translated, cached: outcome.cached })
     } catch (error) {
       if (!signal.aborted) {
         const message = error instanceof Error ? error.message : String(error)
         // 与 Hook 模式一致：翻译失败要在字幕上看得见，而不是静默不动
-        if (previous) showOverlay(previous, `翻译失败：${message}`)
+        if (previous) showOverlay(previous, `翻译失败：${message}`, true, lastGameRect)
         event.sender.send('status', { phase: 'error', message })
       }
     } finally { processing = false }
@@ -626,12 +862,24 @@ async function startOcr(event: Electron.IpcMainInvokeEvent, request: StartReques
   void tick()
 }
 
+/** 目录里有多个 exe 时别盲取第一个：优先与目录同名的，其次体积最大的（launcher/工具一般很小） */
 async function findLaunchTarget(target: string) {
   const stat = await fs.stat(target)
   if (stat.isFile() && path.extname(target).toLowerCase() === '.exe') return target
   const root = stat.isFile() ? path.dirname(target) : target
-  const candidates = (await fs.readdir(root)).filter(name => name.toLowerCase().endsWith('.exe') && !/(unins|uninstall|crash|config|setup)/i.test(name))
-  return candidates.length ? path.join(root, candidates[0]) : undefined
+  const names = (await fs.readdir(root)).filter(name => name.toLowerCase().endsWith('.exe') && !/(unins|uninstall|crash|config|setup|redist|vcredist|dotnet)/i.test(name))
+  if (!names.length) return undefined
+  const folder = path.basename(root).toLowerCase().replace(/\W/g, '')
+  const scored: { file: string; score: number }[] = []
+  for (const name of names) {
+    const full = path.join(root, name)
+    const base = path.basename(name, '.exe').toLowerCase().replace(/\W/g, '')
+    const sameName = base && folder && (base === folder || folder.includes(base) || base.includes(folder))
+    const size = await fs.stat(full).then(item => item.size).catch(() => 0)
+    scored.push({ file: full, score: (sameName ? 1e9 : 0) + size })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored[0].file
 }
 
 async function windowTitlesForExecutable(executable?: string) {
@@ -666,7 +914,7 @@ async function startOcrMode(event: Electron.IpcMainInvokeEvent, request: StartRe
   const existing = await findMatch()
   if (signal.aborted) return
   if (existing) {
-    await startOcr(event, { ...request, sourceId: existing.id, sourceMatch: existing.name.toLowerCase().replace(/\W/g, '') || expected }, signal)
+    await startOcr(event, { ...request, sourceId: existing.id, sourceMatch: existing.name.toLowerCase().replace(/\W/g, '') || expected, anchor: displayBoundsOf(existing.display_id) }, signal)
     return
   }
   if (executable) {
@@ -680,7 +928,7 @@ async function startOcrMode(event: Electron.IpcMainInvokeEvent, request: StartRe
     if (!source) return
     if (safeWaitTimer) clearInterval(safeWaitTimer)
     safeWaitTimer = undefined
-    void startOcr(event, { ...request, sourceId: source.id, sourceMatch: source.name.toLowerCase().replace(/\W/g, '') || expected }, signal)
+    void startOcr(event, { ...request, sourceId: source.id, sourceMatch: source.name.toLowerCase().replace(/\W/g, '') || expected, anchor: displayBoundsOf(source.display_id) }, signal)
   }, 700)
 }
 
@@ -710,17 +958,24 @@ async function doForwardHookText(text: string, cached: boolean) {
   if (!context || context.signal.aborted) return
   const { event, request, signal } = context
   try {
+    const glossary = buildGlossary(request.glossary)
+    const base = `${storyPrompt}\n只翻译台词/界面文本，忽略乱码与控制符。`
     const history = hookHistory.slice(-5).join('\n')
-    const prompt = `${storyPrompt}\n只翻译台词/界面文本，忽略乱码与控制符。${history ? `\n以下为此前文本，仅用于理解上下文：\n${history}` : ''}`
-    const result = await translateOne(text, request.provider, { prompt, signal })
+    const prompt = history ? `${base}\n以下为此前文本，仅用于理解上下文：\n${history}` : base
+    const result = await translateOne(glossary ? glossary.mask(text) : text, request.provider, {
+      prompt,
+      cachePrompt: glossary ? `${base}\n#glossary:${glossary.id}` : base,
+      signal,
+    })
+    const translated = glossary ? glossary.restore(result.translated) : result.translated
     remember(hookHistory, text)
-    showOverlay(text, result.translated)
-    event.sender.send('status', { phase: 'hook', source: text, translated: result.translated, cached: cached || result.cached })
+    showOverlay(text, translated)
+    event.sender.send('status', { phase: 'hook', source: text, translated, cached: cached || result.cached })
   } catch (error) {
     if (signal.aborted) return
     const message = error instanceof Error ? error.message : String(error)
     // 字幕窗上明示失败原因，否则用户只会觉得「字幕根本没翻译」
-    showOverlay(text, `翻译失败：${message}`)
+    showOverlay(text, `翻译失败：${message}`, true)
     event.sender.send('status', { phase: 'error', message, detail: message })
   }
 }
@@ -826,6 +1081,13 @@ async function startHookMode(event: Electron.IpcMainInvokeEvent, request: StartR
   hook = new HookSession(arch)
   hook.attach(path.basename(executable), handlers, request.hookCode)
   armFallback(HOOK_FALLBACK_SECONDS)
+  // 注入已经发出去了，先把字幕窗摆出来，再补上它该落在哪块屏
+  showOverlayStatus('正在等待游戏文本…', lastGameRect)
+  void gameDisplayAnchor(executable).then(anchor => {
+    if (signal.aborted) return
+    if (anchor) lastGameRect = anchor
+    showOverlayStatus('正在等待游戏文本…', lastGameRect)
+  })
 }
 
 /** 循环切换有文本的线程 */
@@ -887,6 +1149,9 @@ async function stopSession() {
   stopOverlayWatch()
   overlay?.close()
   overlay = undefined
+  overlayLines = []
+  overlayStatus = ''
+  lastGameRect = undefined
 }
 
 /** 拖入目标后的唯一入口：识别 → 已装补丁则报告 → 能补丁则补丁，否则 OCR 字幕。 */
@@ -902,6 +1167,7 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
     if (stored?.apiKey) request = { ...request, provider: { ...request.provider, apiKey: stored.apiKey } }
   }
   const send = (data: Record<string, unknown>) => { if (!event.sender.isDestroyed()) event.sender.send('status', data) }
+  const glossary = buildGlossary(request.glossary)
   try {
     send({ phase: 'inspect' })
     const info = await inspectTarget(request.targetPath)
@@ -919,8 +1185,13 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
       if (!text) { send({ phase: 'done', engine: '图片', message: '未在图片中识别到文字' }); return }
       if (signal.aborted) throw new Error('已取消')
       const chunks = textChunks(text, 2000)
-      const translated = await translateBatch(chunks, request.provider, { prompt: '将图片中识别出的文字翻译为自然的简体中文，保留换行。', signal })
-      send({ phase: 'done', engine: '图片', ocrImage: true, source: text, translated: translated.join(''), message: '图片识别翻译完成' })
+      const imagePrompt = '将图片中识别出的文字翻译为自然的简体中文，保留换行。'
+      const translatedChunks = await translateBatch(
+        glossary ? chunks.map(glossary.mask) : chunks,
+        request.provider,
+        { prompt: imagePrompt, cachePrompt: glossary ? `${imagePrompt}\n#glossary:${glossary.id}` : imagePrompt, signal },
+      )
+      send({ phase: 'done', engine: '图片', ocrImage: true, source: text, translated: translatedChunks.map(value => (glossary ? glossary.restore(value) : value)).join(''), message: '图片识别翻译完成' })
       return
     }
     const manifest = await readManifest(info.root)
@@ -940,20 +1211,22 @@ async function start(event: Electron.IpcMainInvokeEvent, request: StartRequest) 
       return
     }
 
-    const patchEngines = ["Ren'Py", 'RPG Maker MV/MZ', 'TyranoBuilder']
+    const patchEngines = ["Ren'Py", 'RPG Maker MV/MZ', 'TyranoBuilder', 'Kirikiri/KAG']
     const isTextProject = info.type === '通用文本项目' || isSingleTextFile
     // 通用文本项目没有游戏进程可 hook，始终走补丁；补丁引擎在「优先 Hook」时跳过补丁
     if (isTextProject || (patchEngines.includes(info.type) && !request.preferHook)) {
       try {
-        const result = await createPatch(event, info, request.provider, signal)
+        const result = await createPatch(event, info, request.provider, signal, glossary)
         if (isSingleTextFile) void shell.openPath(path.resolve(request.targetPath))
         send({ phase: 'done', engine: info.type, patched: true, files: result.files, message: isSingleTextFile ? '翻译完成，已打开译文' : `中文补丁已安装（${result.files} 个文件），直接启动游戏即可` })
         return
       } catch (error) {
         if (signal.aborted) throw error
         if (!(error instanceof Error && error.message === 'NO_PATCHABLE_TEXT')) throw error
-        // 纯文本项目没有游戏进程可 hook，回退到 OCR 只会一直等窗口，直接给出明确结果
-        if (isTextProject) { send({ phase: 'done', engine: info.type, message: '没有找到可翻译的文本' }); return }
+        // 目录里还有 exe 就说明是游戏，回退去 Hook；真的没有可执行文件才给个明确结果，
+        // 否则纯文本项目会一直卡在「等待游戏窗口出现」
+        const hasExecutable = info.files.some(file => file.toLowerCase().endsWith('.exe'))
+        if (isTextProject && !hasExecutable) { send({ phase: 'done', engine: info.type, message: '没有找到可翻译的文本' }); return }
         // 提取不到可补丁文本，回退到 OCR 字幕
       }
     }
@@ -981,9 +1254,70 @@ function createWindow() {
   const win = new BrowserWindow({ width: 720, height: 540, minWidth: 560, minHeight: 440, backgroundColor: '#101418', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } })
   win.setMenuBarVisibility(false)
   mainWindow = win
+  win.on('close', event => {
+    // 翻译还在跑时关窗口只是收进托盘，别把正在进行的会话一起带走
+    if (forceClose || !session) return
+    event.preventDefault()
+    win.hide()
+  })
   win.on('closed', () => { if (mainWindow === win) mainWindow = undefined })
   if (!app.isPackaged) win.loadURL('http://localhost:5173')
   else win.loadFile(path.join(__dirname, '../dist/index.html'))
+}
+
+// ---------- 托盘与全局快捷键 ----------
+
+function notifyMain(data: Record<string, unknown>) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('status', data)
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+async function stopFromAnywhere() {
+  await stopSession()
+  notifyMain({ phase: 'stopped', message: '已停止' })
+}
+
+function switchThreadFromAnywhere() {
+  const index = switchThread()
+  if (!hookGotText) notifyMain({ phase: 'hook-waiting', message: index ? `已切换到文本源 ${index}` : '没有其他文本源可切换' })
+}
+
+function showOverlayFromAnywhere() {
+  overlayDismissed = false
+  const last = overlayLines[overlayLines.length - 1]
+  if (last) showOverlay(last.source, last.translated, last.error, lastGameRect)
+  else if (overlayStatus) showOverlayStatus(overlayStatus, lastGameRect)
+}
+
+function createTray() {
+  if (tray) return
+  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'))
+  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon.resize({ width: 16, height: 16 }))
+  tray.setToolTip('INEEDCHINESE')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主窗口', click: showMainWindow },
+    { type: 'separator' },
+    { label: '停止翻译', click: () => void stopFromAnywhere() },
+    { label: '切换文本源', click: switchThreadFromAnywhere },
+    { label: '改用 OCR 字幕', click: () => switchToOcr('已手动切换 OCR 字幕') },
+    { label: '显示字幕', click: showOverlayFromAnywhere },
+    { type: 'separator' },
+    { label: '退出', click: () => { forceClose = true; app.quit() } },
+  ]))
+  tray.on('double-click', showMainWindow)
+}
+
+/** 全屏游戏里不用切出来就能停/切源 */
+function registerShortcuts() {
+  globalShortcut.register('CommandOrControl+Alt+S', () => void stopFromAnywhere())
+  globalShortcut.register('CommandOrControl+Alt+D', switchThreadFromAnywhere)
+  globalShortcut.register('CommandOrControl+Alt+O', () => switchToOcr('已手动切换 OCR 字幕'))
 }
 
 app.whenReady().then(() => {
@@ -1027,19 +1361,42 @@ app.whenReady().then(() => {
   ipcMain.handle('show-overlay', async () => {
     // 字幕窗被 ✕ 关掉后翻译还在跑，需要一个入口把它叫回来（否则会话期间再也看不到字幕）
     overlayDismissed = false
-    if (lastSubtitle.translated) showOverlay(lastSubtitle.source, lastSubtitle.translated)
+    if (overlayLines.length) {
+      const last = overlayLines[overlayLines.length - 1]
+      showOverlay(last.source, last.translated, last.error)
+    } else if (overlayStatus) showOverlayStatus(overlayStatus, lastGameRect)
   })
-  ipcMain.handle('set-overlay-prefs', (_event, prefs: { fontSize: number; opacity: number }) => {
+  ipcMain.handle('set-overlay-prefs', (_event, prefs: Partial<OverlayPrefs>) => {
     const next: OverlayPrefs = {
       ...overlayPrefs,
-      fontSize: Math.min(34, Math.max(18, Math.round(prefs.fontSize))),
-      opacity: Math.min(1, Math.max(0.3, prefs.opacity)),
+      fontSize: Math.min(34, Math.max(18, Math.round(prefs.fontSize ?? overlayPrefs.fontSize))),
+      opacity: Math.min(1, Math.max(0.3, prefs.opacity ?? overlayPrefs.opacity)),
+      lines: Math.min(OVERLAY_MAX_LINES, Math.max(1, Math.round(prefs.lines ?? overlayPrefs.lines ?? 3))),
+      idleSeconds: Math.min(120, Math.max(0, Math.round(prefs.idleSeconds ?? overlayPrefs.idleSeconds ?? 10))),
     }
-    const changed = next.fontSize !== overlayPrefs.fontSize || next.opacity !== overlayPrefs.opacity
+    const changed = next.fontSize !== overlayPrefs.fontSize || next.opacity !== overlayPrefs.opacity || next.lines !== overlayPrefs.lines || next.idleSeconds !== overlayPrefs.idleSeconds
     overlayPrefs = next
     pushOverlayPrefs()
+    renderOverlay()
     // 从字幕工具栏改的样式同步回主窗口，让 localStorage 也跟着记住
-    if (changed && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-prefs', { fontSize: next.fontSize, opacity: next.opacity })
+    if (changed && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overlay-prefs', { fontSize: next.fontSize, opacity: next.opacity, lines: next.lines, idleSeconds: next.idleSeconds })
+  })
+  ipcMain.handle('set-overlay-pinned', (_event, pinned: boolean) => setOverlayPinned(Boolean(pinned)))
+  ipcMain.handle('export-cache', async () => {
+    const data = await exportCache()
+    const picked = await dialog.showSaveDialog({ defaultPath: 'ineedchinese-翻译记忆.json', filters: [{ name: 'JSON', extensions: ['json'] }] })
+    if (picked.canceled || !picked.filePath) return { saved: 0 }
+    await fs.writeFile(picked.filePath, JSON.stringify(data), 'utf8')
+    return { saved: Object.keys(data).length }
+  })
+  ipcMain.handle('import-cache', async () => {
+    const picked = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'JSON', extensions: ['json'] }] })
+    if (picked.canceled || !picked.filePaths[0]) return { added: 0, total: 0 }
+    try {
+      return await importCache(JSON.parse(await fs.readFile(picked.filePaths[0], 'utf8')) as unknown)
+    } catch (error) {
+      throw new Error(`导入失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   })
   ipcMain.handle('save-llm-config', async (_event, config: LlmStored) => { await writeLlmConfig(config); return { hasKey: Boolean(config.apiKey) } })
   ipcMain.handle('get-llm-config', async () => {
@@ -1047,6 +1404,8 @@ app.whenReady().then(() => {
     return stored ? { baseUrl: stored.baseUrl, model: stored.model, temperature: stored.temperature, hasKey: Boolean(stored.apiKey) } : undefined
   })
   createWindow()
+  createTray()
+  registerShortcuts()
 })
 
 // 退出前统一清理：停会话、终止 OCR worker、缓存落盘
@@ -1054,13 +1413,20 @@ let quitting = false
 app.on('will-quit', event => {
   if (quitting) return
   quitting = true
+  forceClose = true
   event.preventDefault()
+  globalShortcut.unregisterAll()
   void (async () => {
     await stopSession()
     if (ocrWorker) await ocrWorker.terminate().catch(() => undefined)
     ocrWorker = undefined
     await flushCache()
+    tray?.destroy()
+    tray = undefined
     app.exit(0)
   })()
 })
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
+app.on('window-all-closed', () => {
+  // 会话还在跑时窗口只是收进了托盘，等会话结束再退
+  if (process.platform !== 'darwin' && !session) app.quit()
+})

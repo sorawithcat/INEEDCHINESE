@@ -8,7 +8,11 @@ export type ProviderSettings =
   | { kind: 'google' }
   | { kind: 'llm'; baseUrl: string; apiKey: string; model: string; temperature: number }
 
-export type TranslateContext = { prompt: string; signal: AbortSignal }
+/**
+ * cachePrompt 只用于缓存键：实时字幕会把最近几句拼进 prompt 帮助理解上下文，
+ * 如果键跟着上下文变，同一句台词的重复出现几乎永远不命中缓存。所以缓存一律用不含上下文的稳定 prompt。
+ */
+export type TranslateContext = { prompt: string; signal: AbortSignal; cachePrompt?: string }
 
 const cache = new Map<string, string>()
 let cacheLoaded = false
@@ -81,16 +85,42 @@ async function request<T>(fn: () => Promise<T>, signal: AbortSignal, attempts = 
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+// 自适应并发：默认 3，连续跑顺了才慢慢升，出一次错立刻回退。
+// 上限压得很低：被限流的代价（该引擎冷却 5 分钟）远大于省下的那点时间。
+const MIN_CONCURRENCY = 3
+const MAX_CONCURRENCY = 5
+let batchConcurrency = MIN_CONCURRENCY
+let cleanStreak = 0
+
+/** 并发越高，条目间的随机间隔越短 */
+function throttleDelay() {
+  if (batchConcurrency >= 5) return 20 + Math.random() * 40
+  if (batchConcurrency >= 4) return 50 + Math.random() * 80
+  return 90 + Math.random() * 160
+}
+
 async function googleBatch(texts: string[], signal: AbortSignal, onItem?: () => void, onTranslated?: (index: number, translated: string) => void): Promise<string[]> {
   const output: string[] = new Array(texts.length)
   let cursor = 0
-  const workers = Array.from({ length: Math.min(3, texts.length) }, async () => {
-    while (cursor < texts.length) {
+  let active = 0
+  // 固定起满 worker，靠闸门控制真实并发，这样中途调整并发能立刻生效
+  const workers = Array.from({ length: Math.min(MAX_CONCURRENCY, texts.length) }, async () => {
+    while (true) {
       if (signal.aborted) throw new Error('已取消')
+      while (active >= batchConcurrency) await sleep(20)
       const index = cursor++
-      // 随机间隔降低限流概率
-      await sleep(80 + Math.random() * 170)
-      output[index] = await translateFree(texts[index], signal)
+      if (index >= texts.length) return
+      active++
+      try {
+        await sleep(throttleDelay())
+        output[index] = await translateFree(texts[index], signal)
+        if (cleanStreak < 40) cleanStreak++
+        else if (batchConcurrency < MAX_CONCURRENCY) { batchConcurrency++; cleanStreak = 0 }
+      } catch (error) {
+        cleanStreak = 0
+        batchConcurrency = Math.max(MIN_CONCURRENCY, batchConcurrency - 2)
+        throw error
+      } finally { active-- }
       onTranslated?.(index, output[index])
       onItem?.()
     }
@@ -172,7 +202,7 @@ export async function translateBatch(
   onProgress?: (done: number, total: number) => void,
 ): Promise<string[]> {
   await loadCache()
-  const keyOf = (text: string) => cacheKey(settings, text, ctx.prompt)
+  const keyOf = (text: string) => cacheKey(settings, text, ctx.cachePrompt ?? ctx.prompt)
   const keys = texts.map(keyOf)
   // 空 / 纯空白直接当作自身译文：送进翻译通道只会让整批报「全部通道失败」
   texts.forEach((text, position) => { if (!text.trim()) cache.set(keys[position], text) })
@@ -205,7 +235,7 @@ export async function translateBatch(
 /** 单条实时翻译（OCR 字幕用），先查缓存。 */
 export async function translateOne(text: string, settings: ProviderSettings, ctx: TranslateContext): Promise<{ translated: string; cached: boolean }> {
   await loadCache()
-  const key = cacheKey(settings, text, ctx.prompt)
+  const key = cacheKey(settings, text, ctx.cachePrompt ?? ctx.prompt)
   const hit = cache.get(key)
   if (hit) return { translated: hit, cached: true }
   const translated = settings.kind === 'google'
@@ -214,4 +244,24 @@ export async function translateOne(text: string, settings: ProviderSettings, ctx
   cache.set(key, translated)
   scheduleSave()
   return { translated, cached: false }
+}
+
+/** 导出全部翻译记忆（键是文本与设置一起算出的摘要，只能整包备份/共享，不适合手工编辑） */
+export async function exportCache(): Promise<Record<string, string>> {
+  await loadCache()
+  return Object.fromEntries(cache)
+}
+
+/** 合并导入翻译记忆：只补空缺，不覆盖已有译文；返回新增条数与总量 */
+export async function importCache(data: unknown): Promise<{ added: number; total: number }> {
+  await loadCache()
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('翻译记忆文件格式不对')
+  let added = 0
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    if (typeof value !== 'string' || cache.has(key)) continue
+    cache.set(key, value)
+    added++
+  }
+  await flushCache()
+  return { added, total: cache.size }
 }

@@ -4,6 +4,20 @@ type LlmConfig = { baseUrl: string; apiKey: string; model: string; temperature: 
 type HistoryItem = { path: string; time: number }
 
 const defaultLlm: LlmConfig = { baseUrl: 'https://api.deepseek.com', apiKey: '', model: 'deepseek-chat', temperature: 0.2 }
+const defaultOverlayPrefs: OverlayPrefs = { fontSize: 24, opacity: 0.9, lines: 3, idleSeconds: 10 }
+
+/** 术语表按「原文=译文」逐行解析；译文里可以有等号，所以只按第一个等号切 */
+function parseGlossary(text: string): GlossaryEntry[] {
+  const entries: GlossaryEntry[] = []
+  for (const line of text.split('\n')) {
+    const index = line.indexOf('=')
+    if (index <= 0) continue
+    const from = line.slice(0, index).trim()
+    const to = line.slice(index + 1).trim()
+    if (from && to) entries.push({ from, to })
+  }
+  return entries
+}
 
 function load<T>(key: string, fallback: T): T {
   try { return { ...fallback, ...JSON.parse(localStorage.getItem(key) || '{}') } } catch { return fallback }
@@ -31,8 +45,11 @@ export default function App() {
   const [preferHook, setPreferHook] = useState(() => localStorage.getItem('engine-preference') === 'hook')
   const [ocrLang, setOcrLang] = useState(() => localStorage.getItem('ocr-lang') || 'jpn+eng')
   const [hookCode, setHookCode] = useState(() => localStorage.getItem('hook-code') || '')
-  const [overlayPrefs, setOverlayPrefs] = useState<OverlayPrefs>(() => load('overlay-prefs', { fontSize: 24, opacity: 0.9 }))
+  const [glossaryText, setGlossaryText] = useState(() => localStorage.getItem('glossary') || '')
+  const [ocrRegion, setOcrRegion] = useState<'lower' | 'full'>(() => localStorage.getItem('ocr-region') === 'full' ? 'full' : 'lower')
+  const [overlayPrefs, setOverlayPrefs] = useState<OverlayPrefs>(() => load('overlay-prefs', defaultOverlayPrefs))
   const [overlayBounds, setOverlayBounds] = useState<OverlayBounds | undefined>(loadBounds)
+  const [cacheMsg, setCacheMsg] = useState('')
   const [history, setHistory] = useState<HistoryItem[]>(() => loadList('history'))
   const [tab, setTab] = useState<'file' | 'text'>('file')
   const [pasteText, setPasteText] = useState('')
@@ -48,14 +65,16 @@ export default function App() {
     setOverlayBounds(bounds)
     localStorage.setItem('overlay-bounds', JSON.stringify(bounds))
   }), [])
-  // 字幕工具栏改了字号/不透明度：值没变时保持原对象，避免 effect 回传造成循环
+  // 字幕工具栏改了样式：值没变时保持原对象，避免 effect 回传造成循环
   useEffect(() => window.translator.onOverlayPrefs(prefs => {
-    setOverlayPrefs(prev => prev.fontSize === prefs.fontSize && prev.opacity === prefs.opacity ? prev : { ...prev, ...prefs })
+    setOverlayPrefs(prev => prev.fontSize === prefs.fontSize && prev.opacity === prefs.opacity && prev.lines === prefs.lines && prev.idleSeconds === prefs.idleSeconds ? prev : { ...prev, ...prefs })
   }), [])
   useEffect(() => localStorage.setItem('provider-kind', providerKind), [providerKind])
   useEffect(() => localStorage.setItem('engine-preference', preferHook ? 'hook' : 'patch'), [preferHook])
   useEffect(() => localStorage.setItem('ocr-lang', ocrLang), [ocrLang])
+  useEffect(() => localStorage.setItem('ocr-region', ocrRegion), [ocrRegion])
   useEffect(() => localStorage.setItem('hook-code', hookCode), [hookCode])
+  useEffect(() => localStorage.setItem('glossary', glossaryText), [glossaryText])
   useEffect(() => localStorage.setItem('overlay-prefs', JSON.stringify(overlayPrefs)), [overlayPrefs])
   useEffect(() => { void window.translator.setOverlayPrefs(overlayPrefs) }, [overlayPrefs])
   useEffect(() => localStorage.setItem('history', JSON.stringify(history)), [history])
@@ -98,8 +117,10 @@ export default function App() {
         provider,
         preferHook,
         ocrLangs: ocrLang.split('+'),
+        ocrRegion,
         overlayPrefs: { ...overlayPrefs, bounds: overlayBounds },
         hookCode: hookCode.trim() || undefined,
+        glossary: parseGlossary(glossaryText),
       })
     }
     catch (error) { setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) }) }
@@ -115,6 +136,20 @@ export default function App() {
       const result = await window.translator.restore(target)
       setStatus({ phase: 'stopped', message: `已恢复 ${result.restored} 个原始文件` })
     } catch (error) { setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) }) }
+  }
+
+  async function exportMemory() {
+    try {
+      const result = await window.translator.exportCache()
+      setCacheMsg(result.saved ? `已导出 ${result.saved} 条翻译记忆` : '已取消')
+    } catch (error) { setCacheMsg(error instanceof Error ? error.message : String(error)) }
+  }
+
+  async function importMemory() {
+    try {
+      const result = await window.translator.importCache()
+      setCacheMsg(result.added ? `新增 ${result.added} 条，现有 ${result.total} 条` : `没有新增条目（现有 ${result.total} 条）`)
+    } catch (error) { setCacheMsg(error instanceof Error ? error.message : String(error)) }
   }
 
   async function translatePaste() {
@@ -309,6 +344,16 @@ export default function App() {
             <label>Hook 特殊码（可选）<input value={hookCode} placeholder="留空自动识别，如 HSN-8@0" onChange={event => setHookCode(event.target.value)} /></label>
             <p className="note">自动 Hook 抓不到台词时再填。Textractor 界面里「Add hook」用的那串代码，直接粘贴即可。</p>
           </div>
+          <p className="label">术语表（可选）</p>
+          <div className="fields">
+            <textarea
+              className="glossary"
+              placeholder={'每行一条：原文=译文\n\nユメミ=梦见\n聖アストラ学園=圣阿斯特拉学园'}
+              value={glossaryText}
+              onChange={event => setGlossaryText(event.target.value)}
+            />
+            <p className="note">命中的词按你写的译文原样输出，不再交给翻译通道。人名、技能名、专有名词用它锁死。</p>
+          </div>
           <p className="label">OCR 源语言</p>
           <label className="radio">
             <input type="radio" checked={ocrLang === 'jpn+eng'} onChange={() => setOcrLang('jpn+eng')} />
@@ -322,10 +367,29 @@ export default function App() {
             <input type="radio" checked={ocrLang === 'eng'} onChange={() => setOcrLang('eng')} />
             <span><b>仅英语</b></span>
           </label>
+          <p className="label">OCR 识别区域</p>
+          <label className="radio">
+            <input type="radio" checked={ocrRegion === 'lower'} onChange={() => setOcrRegion('lower')} />
+            <span><b>窗口下半屏</b><small>台词一般都在下方，误识别更少（默认）</small></span>
+          </label>
+          <label className="radio">
+            <input type="radio" checked={ocrRegion === 'full'} onChange={() => setOcrRegion('full')} />
+            <span><b>整个窗口</b><small>文字在上方或铺满画面时用</small></span>
+          </label>
           <p className="label">字幕样式</p>
           <div className="fields">
             <label>字号 {overlayPrefs.fontSize}px<input type="range" min="18" max="34" step="1" value={overlayPrefs.fontSize} onChange={event => setOverlayPrefs({ ...overlayPrefs, fontSize: Number(event.target.value) })} /></label>
             <label>背景不透明度 {Math.round(overlayPrefs.opacity * 100)}%<input type="range" min="30" max="100" step="5" value={Math.round(overlayPrefs.opacity * 100)} onChange={event => setOverlayPrefs({ ...overlayPrefs, opacity: Number(event.target.value) / 100 })} /></label>
+            <label>保留行数 {overlayPrefs.lines} 行<input type="range" min="1" max="5" step="1" value={overlayPrefs.lines} onChange={event => setOverlayPrefs({ ...overlayPrefs, lines: Number(event.target.value) })} /></label>
+            <label>{overlayPrefs.idleSeconds ? `${overlayPrefs.idleSeconds} 秒无新译文后淡出` : '不自动淡出'}<input type="range" min="0" max="60" step="5" value={overlayPrefs.idleSeconds} onChange={event => setOverlayPrefs({ ...overlayPrefs, idleSeconds: Number(event.target.value) })} /></label>
+          </div>
+          <p className="label">翻译记忆</p>
+          <div className="fields">
+            <div className="row">
+              <button className="button" onClick={exportMemory}>导出</button>
+              <button className="button" onClick={importMemory}>导入</button>
+            </div>
+            {cacheMsg && <p className="note">{cacheMsg}</p>}
           </div>
           <p className="note">翻译结果会缓存到本地，重复内容不再消耗请求。字幕平时点击穿透；把鼠标移到字幕顶部，工具栏就会亮起，可以拖动、调样式或关闭。</p>
         </aside>

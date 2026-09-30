@@ -14,6 +14,9 @@ contextBridge.exposeInMainWorld('translator', {
   getLlmConfig: () => ipcRenderer.invoke('get-llm-config'),
   closeOverlay: () => ipcRenderer.invoke('close-overlay'),
   showOverlay: () => ipcRenderer.invoke('show-overlay'),
+  setOverlayPinned: (pinned: boolean) => ipcRenderer.invoke('set-overlay-pinned', pinned),
+  exportCache: () => ipcRenderer.invoke('export-cache'),
+  importCache: () => ipcRenderer.invoke('import-cache'),
   onStatus: (callback: (status: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status)
     ipcRenderer.on('status', listener)
